@@ -1,19 +1,23 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import { normalizeDegrees, objBounds, regularRadius, regularSize, rotateObj, unionBounds } from "./geometry";
+import { artToWorld, normalizeDegrees, objBounds, regularRadius, regularSize, rotateObj, unionBounds, worldToArt } from "./geometry";
 import type { RawContour } from "./import-svg";
-import { computePattern } from "./pattern";
-import { arrangement, isFilled } from "./regions";
+import { computePattern, patternKey } from "./pattern";
+import { nearestChain } from "./graph";
+import { chainLines, matchTolerance, thinGraph } from "./outline";
+import { arrangement, chainIndexAt, cutChains, isFilled, regionContains, worldChains, worldThinChains } from "./regions";
 import type {
   Artwork,
   Bounds,
   DisplaySettings,
   GcodeSettings,
+  LayerSettings,
   Obj,
   Pattern,
   PatternSettings,
   PrintSettings,
+  Pt,
   RefShape,
   Units,
 } from "./types";
@@ -32,8 +36,10 @@ export interface State {
   future: Obj[][];
   /** Transient UI message, e.g. import warnings. */
   notice: { text: string; kind: "info" | "error" } | null;
-  /** Clicking the canvas toggles region fills instead of selecting. */
-  pickRegions: boolean;
+  /** Clicking the canvas toggles region fills, lines, nails or line widths, instead of selecting. */
+  pickMode: "regions" | "lines" | "nails" | "widths" | null;
+  /** Width given to pieces of line clicked in "widths" mode (mm). */
+  paintWidth: number;
 }
 
 const STORAGE_KEY = "makernaked.string-art.v1";
@@ -97,7 +103,8 @@ function initialState(): State {
     past: [],
     future: [],
     notice: null,
-    pickRegions: false,
+    pickMode: null,
+    paintWidth: 0.25 * MM_PER_IN,
   };
 }
 
@@ -235,6 +242,7 @@ export function undo() {
       selection: s.selection.filter((id) => ids.has(id)),
     };
   });
+  autoRecalculate();
 }
 
 export function redo() {
@@ -249,6 +257,7 @@ export function redo() {
       selection: s.selection.filter((id) => ids.has(id)),
     };
   });
+  autoRecalculate();
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +507,7 @@ export function reshapeRef(s: RefShape, patch: Partial<RefShape>): RefShape {
   return r === null ? next : { ...next, ...regularSize(next, r) };
 }
 
-export function makeArtwork(name: string, contours: RawContour[]): Artwork | null {
+export function makeArtwork(name: string, contours: RawContour[], hiddenLayers: string[] = []): Artwork | null {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -516,6 +525,10 @@ export function makeArtwork(name: string, contours: RawContour[]): Artwork | nul
   const round = (v: number) => Math.round(v * 1e4) / 1e4;
   const w0 = Math.max(maxX - minX, 0.01);
   const h0 = Math.max(maxY - minY, 0.01);
+  // Scale widths by the file's line weights when its single lines differ.
+  const weights = new Set(contours.filter((c) => !c.closed && c.weight).map((c) => c.weight));
+  const present = new Set(contours.map((c) => c.layer));
+  const hidden = hiddenLayers.filter((l) => present.has(l));
   return {
     id: newId(),
     name,
@@ -529,7 +542,15 @@ export function makeArtwork(name: string, contours: RawContour[]): Artwork | nul
     rotation: 0,
     contours: contours
       .filter((c) => c.pts.length > 1)
-      .map((c) => ({ closed: c.closed, pts: c.pts.flatMap(([x, y]) => [round(x - cx), round(y - cy)]) })),
+      .map((c) => ({
+        closed: c.closed,
+        pts: c.pts.flatMap(([x, y]) => [round(x - cx), round(y - cy)]),
+        ...(c.layer ? { layer: c.layer } : {}),
+        ...(c.weight ? { weight: round(c.weight) } : {}),
+        ...(c.filled ? { filled: true } : {}),
+      })),
+    ...(weights.size > 1 ? { lineWeights: true } : {}),
+    ...(hidden.length ? { layers: Object.fromEntries(hidden.map((l) => [l, { include: false }])) } : {}),
   };
 }
 
@@ -537,9 +558,89 @@ export function makeArtwork(name: string, contours: RawContour[]): Artwork | nul
 // Regions
 
 export function toggleRegion(artId: string, index: number) {
+  const a = findArt(artId);
+  const region = a && arrangement(a).regions[index];
+  if (!a || !region) return;
+  // The choice is saved as a point inside the region; earlier ones inside it are replaced.
+  const on = !isFilled(a, index);
+  const fills = (a.fills ?? []).filter((f) => !regionContains(region, f.at));
+  updateObject(artId, { fills: [...fills, { at: region.sample, on }] } as Partial<Artwork>);
+  autoRecalculate();
+}
+
+function findArt(id: string): Artwork | undefined {
+  return state.objects.find((o): o is Artwork => o.id === id && o.type === "art");
+}
+
+/** Removes a line piece (no nails, regions either side join), or puts it back. */
+export function toggleLine(artId: string, index: number) {
+  const a = findArt(artId);
+  const piece = a && worldChains(a)[index];
+  if (!a || !piece) return;
+  const cuts = a.cuts ?? [];
+  const next = cutChains(a).has(index) ? cuts.filter((p) => chainIndexAt(a, p) !== index) : [...cuts, piece.mid];
+  updateObject(artId, { cuts: next.length ? next : undefined } as Partial<Artwork>);
+  autoRecalculate();
+}
+
+/**
+ * Gives a piece of single line (or with `wholeLine`, every piece of the drawn
+ * line) its own width in artwork units. Clicking again with the same width goes
+ * back to the layer's width.
+ */
+export function paintLineWidth(artId: string, index: number, width: number, wholeLine: boolean) {
+  const a = findArt(artId);
+  if (!a) return;
+  const g = thinGraph(a);
+  const pieces = worldThinChains(a);
+  if (!pieces[index]) return;
+  const lineOf = chainLines(g);
+  const targets = wholeLine ? pieces.flatMap((_, i) => (lineOf[i] === lineOf[index] ? [i] : [])) : [index];
+  const tol = matchTolerance(a);
+  const pieceOf = (p: Pt) => nearestChain(g.verts, g.chains, p, tol);
+  const current = a.widths ?? [];
+  const mine = current.filter((w) => targets.includes(pieceOf(w.at)));
+  const already = mine.length === targets.length && mine.every((w) => Math.abs(w.width - width) < 1e-9);
+  const widths = current.filter((w) => !targets.includes(pieceOf(w.at)));
+  if (!already) widths.push(...targets.map((i) => ({ at: pieces[i].mid, width })));
+  updateObject(artId, { widths: widths.length ? widths : undefined } as Partial<Artwork>);
+  autoRecalculate();
+}
+
+export function restoreWidths() {
+  const ids = new Set(regionTargets().map((a) => a.id));
+  setObjects(state.objects.map((o) => (o.type === "art" && ids.has(o.id) ? { ...o, widths: undefined } : o)));
+  autoRecalculate();
+}
+
+/**
+ * Takes out the nail at a world point, or puts back a removed one there. Removed
+ * nails are kept by position on the artwork, so they survive recalculating.
+ */
+export function toggleNail(artId: string, x: number, y: number) {
   const a = state.objects.find((o): o is Artwork => o.id === artId && o.type === "art");
   if (!a) return;
-  updateObject(artId, { fill: { ...a.fill, [index]: !isFilled(a, index) } } as Partial<Artwork>);
+  const list = a.removedNails ?? [];
+  const within = state.settings.spacing * 0.45;
+  const i = list.findIndex(([lx, ly]) => {
+    const [wx, wy] = artToWorld(a, lx, ly);
+    return Math.hypot(wx - x, wy - y) < within;
+  });
+  const removedNails = i >= 0 ? list.filter((_, k) => k !== i) : [...list, worldToArt(a, x, y)];
+  updateObject(artId, { removedNails: removedNails.length ? removedNails : undefined } as Partial<Artwork>);
+  autoRecalculate();
+}
+
+export function restoreNails() {
+  const ids = new Set(regionTargets().map((a) => a.id));
+  setObjects(state.objects.map((o) => (o.type === "art" && ids.has(o.id) ? { ...o, removedNails: undefined } : o)));
+  autoRecalculate();
+}
+
+export function restoreLines() {
+  const ids = new Set(regionTargets().map((a) => a.id));
+  setObjects(state.objects.map((o) => (o.type === "art" && ids.has(o.id) ? { ...o, cuts: undefined } : o)));
+  autoRecalculate();
 }
 
 /** Artwork the region buttons act on: the selected artwork, or all of it. */
@@ -555,27 +656,69 @@ export function setAllRegions(value: boolean | null) {
   setObjects(
     state.objects.map((o) => {
       if (o.type !== "art" || !ids.has(o.id)) return o;
-      const fill = value === null ? undefined : Object.fromEntries(arrangement(o).regions.map((_, i) => [i, value]));
-      return { ...o, fill };
+      const fills = value === null ? undefined : arrangement(o).regions.map((r) => ({ at: r.sample, on: value }));
+      return { ...o, fills };
     }),
   );
+  autoRecalculate();
 }
 
-/** Changing the gap or line width re-detects regions, so earlier fill choices no longer apply. */
+// Region fills, removed lines and nails, and painted widths are saved as positions,
+// so they carry over when the gap, widths or layers change.
 export function setArtGap(id: string, gap: number) {
-  updateObject(id, { gap, fill: undefined } as Partial<Artwork>);
+  updateObject(id, { gap } as Partial<Artwork>);
 }
 
 export function setArtLineWidth(id: string, lineWidth: number) {
-  updateObject(id, { lineWidth, fill: undefined } as Partial<Artwork>);
+  updateObject(id, { lineWidth } as Partial<Artwork>);
+}
+
+export function setArtLineWeights(id: string, lineWeights: boolean) {
+  updateObject(id, { lineWeights } as Partial<Artwork>);
+}
+
+/** Includes/leaves out a layer or sets its line width (`lineWidth: undefined` goes back to the artwork's). */
+export function setArtLayer(id: string, layer: string, patch: LayerSettings) {
+  const a = state.objects.find((o): o is Artwork => o.id === id && o.type === "art");
+  if (!a) return;
+  const next = { ...a.layers?.[layer], ...patch };
+  if (next.include !== false) delete next.include;
+  if (next.lineWidth === undefined) delete next.lineWidth;
+  const layers = { ...a.layers, [layer]: next };
+  if (!Object.keys(next).length) delete layers[layer];
+  updateObject(id, { layers: Object.keys(layers).length ? layers : undefined } as Partial<Artwork>);
 }
 
 // ---------------------------------------------------------------------------
 // Pattern
 
+/** Recent results by input, so undo/redo back to a calculated state is instant. */
+const patternCache = new Map<string, Pattern>();
+const PATTERN_CACHE_SIZE = 20;
+
 export function calculatePattern() {
-  const pattern = computePattern(state.objects, state.settings);
+  const key = patternKey(state.objects, state.settings);
+  let pattern = patternCache.get(key);
+  if (pattern) patternCache.delete(key);
+  else pattern = computePattern(state.objects, state.settings);
+  patternCache.set(key, pattern);
+  if (patternCache.size > PATTERN_CACHE_SIZE) patternCache.delete(patternCache.keys().next().value!);
   setState({ pattern });
+}
+
+let recalcTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Brings an existing pattern up to date shortly after region, line and nail
+ * edits and undo/redo. Moves and setting changes still wait for Recalculate.
+ */
+function autoRecalculate() {
+  if (!state.pattern) return;
+  if (recalcTimer) clearTimeout(recalcTimer);
+  recalcTimer = setTimeout(() => {
+    recalcTimer = null;
+    if (state.pattern && state.pattern.key !== patternKey(state.objects, state.settings)) calculatePattern();
+  }, 120);
 }
 
 export function notify(text: string, kind: "info" | "error" = "info") {

@@ -1,5 +1,6 @@
 import { jsPDF } from "jspdf";
 import { worldContours } from "./geometry";
+import { worldEdges } from "./regions";
 import { patternStats } from "./pattern";
 import type { State } from "./store";
 import { PAPERS, planTiles, printBounds, tileLabel, type TilePlan } from "./tiles";
@@ -94,8 +95,13 @@ export function buildPDF(s: State): Blob {
 
       for (const o of s.objects) {
         if (o.type === "ref" ? !ps.refs : !ps.outline) continue;
-        if (o.type === "ref") style([90, 160, 220], 0.25, [2, 1.5]);
-        else style([140, 140, 140], 0.25);
+        if (o.type === "art") {
+          style([140, 140, 140], 0.25);
+          const segs = worldEdges(o);
+          for (let i = 0; i < segs.length; i += 4) seg(segs[i], segs[i + 1], segs[i + 2], segs[i + 3]);
+          continue;
+        }
+        style([90, 160, 220], 0.25, [2, 1.5]);
         for (const ct of worldContours(o)) {
           const n = ct.pts.length;
           for (let i = 0; i < (ct.closed ? n : n - 1); i++) {
@@ -266,14 +272,8 @@ function drawCover(
   doc.setLineWidth(0.15);
   for (const o of s.objects) {
     if (o.type !== "art") continue;
-    for (const c of worldContours(o)) {
-      const n = c.pts.length;
-      for (let i = 0; i < (c.closed ? n : n - 1); i++) {
-        const a = c.pts[i];
-        const b = c.pts[(i + 1) % n];
-        doc.line(MX(a[0]), MY(a[1]), MX(b[0]), MY(b[1]));
-      }
-    }
+    const segs = worldEdges(o);
+    for (let i = 0; i < segs.length; i += 4) doc.line(MX(segs[i]), MY(segs[i + 1]), MX(segs[i + 2]), MY(segs[i + 3]));
   }
   doc.setFillColor(40, 40, 40);
   const dot = Math.max(0.15, Math.min(0.6, s.settings.spacing * k * 0.2));

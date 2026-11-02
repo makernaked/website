@@ -1,5 +1,6 @@
-import { pointInPolygon, polygonArea, toLocal, toWorld } from "./geometry";
-import { artGap, artLines, artLineWidth, type Line } from "./outline";
+import { artToWorld, pointInPolygon, polygonArea, toLocal, toWorld } from "./geometry";
+import { buildGraph, chainMidpoint, edgeKey, type Graph, nearestChain } from "./graph";
+import { artGap, artLineKey, artLines, layerIncluded, matchTolerance, occluders, thinGraph } from "./outline";
 import type { Artwork, Contour, Pt } from "./types";
 
 /**
@@ -7,6 +8,10 @@ import type { Artwork, Contour, Pt } from "./types";
  * they cross and every enclosed area becomes a region. Works on the prepared
  * lines (see outline.ts) in the artwork's local coordinates, so the result
  * survives moving, scaling and rotating.
+ *
+ * The user's choices are saved as positions on the artwork: a region's fill as
+ * a point inside it, a removed line as a point on it. They find their region
+ * or line again after the drawing changes (gap, widths, layers).
  */
 
 export interface Region {
@@ -17,35 +22,129 @@ export interface Region {
   area: number;
   /** Filled unless the user says otherwise: inside an odd number of the drawing's closed outlines. */
   defaultFill: boolean;
+  /** A point well inside the region. */
+  sample: Pt;
 }
 
 export interface Arrangement {
   verts: Pt[];
-  /** Every line piece, including loose ends and gap extensions (nails go on all of them). */
+  /** Line pieces that get nails, including loose ends and gap extensions. */
   edges: [number, number][];
   regions: Region[];
 }
 
-const cache = new WeakMap<Contour[], Map<string, Arrangement>>();
-
-export function arrangement(a: Artwork): Arrangement {
-  const gap = artGap(a);
-  const key = `${gap}|${artLineWidth(a)}`;
-  let byKey = cache.get(a.contours);
-  if (!byKey) {
-    byKey = new Map();
-    cache.set(a.contours, byKey);
-  }
-  let r = byKey.get(key);
-  if (!r) {
-    r = buildArrangement(artLines(a), gap * 0.25);
-    byKey.set(key, r);
-  }
-  return r;
+interface Base extends Arrangement {
+  /** Every line piece before any are removed. */
+  graph: Graph;
+  /** Closed outlines that decide default fills: shapes from the file, and band outlines. */
+  outlines: { shapes: Pt[][]; bands: Pt[][] };
+  diag: number;
+  bboxArea: number;
 }
 
+const baseCache = new WeakMap<Contour[], Map<string, Base>>();
+const effectiveCache = new WeakMap<Contour[], Map<string, Arrangement>>();
+
+function cached<T>(store: WeakMap<Contour[], Map<string, T>>, a: Artwork, key: string, make: () => T): T {
+  let byKey = store.get(a.contours);
+  if (!byKey) {
+    byKey = new Map();
+    store.set(a.contours, byKey);
+  }
+  let v = byKey.get(key);
+  if (v === undefined) {
+    v = make();
+    byKey.set(key, v);
+  }
+  return v;
+}
+
+function base(a: Artwork): Base {
+  return cached(baseCache, a, artLineKey(a), () => {
+    const lines = artLines(a);
+    // Parts of lines and bands that run under a filled shape drawn after them are hidden.
+    const over = occluders(a);
+    const hidden = (line: (typeof lines)[number], [x, y]: Pt) => {
+      if (line.kind === "shape") return false;
+      for (const s of over) {
+        if (x < s.minX || x > s.maxX || y < s.minY || y > s.maxY) continue;
+        if (line.kind === "thin" ? (line.src ?? -1) >= s.order : !s.coversBands) continue;
+        if (pointInPolygon(x, y, s.pts)) return true;
+      }
+      return false;
+    };
+    const keep = over.length
+      ? ([u, v]: [number, number], src: Graph["src"][number], verts: Pt[]) =>
+          !hidden(lines[src.line], [(verts[u][0] + verts[v][0]) / 2, (verts[u][1] + verts[v][1]) / 2])
+      : undefined;
+    const graph = buildGraph(lines, artGap(a) * 0.25, keep);
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of graph.verts) {
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+    const diag = Math.hypot(maxX - minX, maxY - minY) || 1;
+    const bboxArea = (maxX - minX) * (maxY - minY) || 1;
+    const outlines = {
+      shapes: lines.filter((l) => l.closed && l.kind !== "band").map((l) => l.pts),
+      bands: lines.filter((l) => l.kind === "band").map((l) => l.pts),
+    };
+    const regions = findRegions(graph.verts, graph.edges, outlines, diag, bboxArea);
+    return { verts: graph.verts, edges: graph.edges, regions, graph, outlines, diag, bboxArea };
+  });
+}
+
+/** Line pieces the user has removed (indices into the line pieces). */
+export function cutChains(a: Artwork): Set<number> {
+  const g = base(a).graph;
+  const tol = matchTolerance(a);
+  const out = new Set<number>();
+  for (const p of a.cuts ?? []) {
+    const ci = nearestChain(g.verts, g.chains, p, tol);
+    if (ci >= 0) out.add(ci);
+  }
+  return out;
+}
+
+/** The line piece a saved point sits on, or -1. */
+export function chainIndexAt(a: Artwork, p: Pt): number {
+  const g = base(a).graph;
+  return nearestChain(g.verts, g.chains, p, matchTolerance(a));
+}
+
+/** Regions and nail lines with the user's removed lines taken out. */
+export function arrangement(a: Artwork): Arrangement {
+  const b = base(a);
+  if (!a.cuts?.length) return b;
+  return cached(effectiveCache, a, `${artLineKey(a)}|${JSON.stringify(a.cuts)}`, () => {
+    const cut = new Set<string>();
+    for (const ci of cutChains(a)) {
+      const c = b.graph.chains[ci];
+      const n = c.verts.length;
+      for (let k = 0; k < (c.closed ? n : n - 1); k++) cut.add(edgeKey(c.verts[k], c.verts[(k + 1) % n]));
+    }
+    const edges = b.edges.filter(([u, v]) => !cut.has(edgeKey(u, v)));
+    return { verts: b.verts, edges, regions: findRegions(b.verts, edges, b.outlines, b.diag, b.bboxArea) };
+  });
+}
+
+/** Whether a local point lies in a region (and not in one of its holes). */
+export function regionContains(r: Region, p: Pt): boolean {
+  return pointInPolygon(p[0], p[1], r.pts[0]) && !r.pts.slice(1).some((h) => pointInPolygon(p[0], p[1], h));
+}
+
+/** A saved fill choice inside the region wins (the latest); otherwise the default. */
 export function isFilled(a: Artwork, index: number): boolean {
-  return a.fill?.[index] ?? arrangement(a).regions[index]?.defaultFill ?? false;
+  const r = arrangement(a).regions[index];
+  if (!r) return false;
+  const fills = a.fills ?? [];
+  for (let i = fills.length - 1; i >= 0; i--) if (regionContains(r, fills[i].at)) return fills[i].on;
+  return r.defaultFill;
 }
 
 const worldCache = new WeakMap<Artwork, Pt[][][]>();
@@ -67,175 +166,126 @@ export function regionAt(a: Artwork, x: number, y: number): number {
   const sx = a.w0 > 0 ? a.w / a.w0 : 1;
   const sy = a.h0 > 0 ? a.h / a.h0 : 1;
   const [lx, ly] = toLocal(a, x, y);
-  const px = lx / sx;
-  const py = ly / sy;
-  return arrangement(a).regions.findIndex(
-    (r) => pointInPolygon(px, py, r.pts[0]) && !r.pts.slice(1).some((h) => pointInPolygon(px, py, h)),
-  );
+  const p: Pt = [lx / sx, ly / sy];
+  return arrangement(a).regions.findIndex((r) => regionContains(r, p));
+}
+
+const edgeWorldCache = new WeakMap<Artwork, Float64Array>();
+
+/** The line pieces in use, as world segments [x1, y1, x2, y2, ...]; removed lines are left out. */
+export function worldEdges(a: Artwork): Float64Array {
+  let w = edgeWorldCache.get(a);
+  if (!w) {
+    const { verts, edges } = arrangement(a);
+    const world = verts.map(([x, y]) => artToWorld(a, x, y));
+    w = new Float64Array(edges.length * 4);
+    edges.forEach(([u, v], i) => w!.set([world[u][0], world[u][1], world[v][0], world[v][1]], i * 4));
+    edgeWorldCache.set(a, w);
+  }
+  return w;
+}
+
+const guideCache = new WeakMap<Artwork, { pts: Pt[]; closed: boolean }[]>();
+
+/** Paths on layers that are left out, in world coordinates, to show as guides. */
+export function worldLeftOut(a: Artwork): { pts: Pt[]; closed: boolean }[] {
+  let w = guideCache.get(a);
+  if (!w) {
+    w = a.contours
+      .filter((c) => !layerIncluded(a, c.layer))
+      .map((c) => {
+        const pts: Pt[] = [];
+        for (let i = 0; i + 1 < c.pts.length; i += 2) pts.push(artToWorld(a, c.pts[i], c.pts[i + 1]));
+        return { pts, closed: c.closed };
+      });
+    guideCache.set(a, w);
+  }
+  return w;
+}
+
+export interface WorldChain {
+  pts: Pt[];
+  closed: boolean;
+  /** Where the piece is saved from (its midpoint, in artwork units). */
+  mid: Pt;
+}
+
+function toWorldChains(a: Artwork, g: Graph): WorldChain[] {
+  return g.chains.map((c) => ({
+    closed: c.closed,
+    pts: c.verts.map((v) => artToWorld(a, g.verts[v][0], g.verts[v][1])),
+    mid: chainMidpoint(g.verts, c),
+  }));
+}
+
+const chainWorldCache = new WeakMap<Artwork, WorldChain[]>();
+const thinWorldCache = new WeakMap<Artwork, WorldChain[]>();
+
+/** Removable line pieces (of the prepared drawing, so band edges too), in world coordinates. */
+export function worldChains(a: Artwork): WorldChain[] {
+  let w = chainWorldCache.get(a);
+  if (!w) {
+    w = toWorldChains(a, base(a).graph);
+    chainWorldCache.set(a, w);
+  }
+  return w;
+}
+
+/** Pieces of the thin drawing (what widths are painted onto), in world coordinates. */
+export function worldThinChains(a: Artwork): WorldChain[] {
+  let w = thinWorldCache.get(a);
+  if (!w) {
+    w = toWorldChains(a, thinGraph(a));
+    thinWorldCache.set(a, w);
+  }
+  return w;
+}
+
+/** Index of the chain within `tol` of a world point (closest first), or -1. */
+export function worldChainAt(chains: WorldChain[], x: number, y: number, tol: number): number {
+  let best = -1;
+  let bestD = tol;
+  chains.forEach((c, ci) => {
+    const n = c.pts.length;
+    for (let i = 0; i < (c.closed ? n : n - 1); i++) {
+      const p = c.pts[i];
+      const q = c.pts[(i + 1) % n];
+      if (Math.min(p[0], q[0]) - bestD > x || Math.max(p[0], q[0]) + bestD < x) continue;
+      if (Math.min(p[1], q[1]) - bestD > y || Math.max(p[1], q[1]) + bestD < y) continue;
+      const dx = q[0] - p[0];
+      const dy = q[1] - p[1];
+      const len2 = dx * dx + dy * dy;
+      const t = len2 ? Math.max(0, Math.min(1, ((x - p[0]) * dx + (y - p[1]) * dy) / len2)) : 0;
+      const d = Math.hypot(x - (p[0] + t * dx), y - (p[1] + t * dy));
+      if (d < bestD) {
+        bestD = d;
+        best = ci;
+      }
+    }
+  });
+  return best;
 }
 
 // ---------------------------------------------------------------------------
 
-/** `stub`: loose bits shorter than this, left where a line overshoots another, are dropped. */
-export function buildArrangement(lines: Line[], stub: number): Arrangement {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const l of lines)
-    for (const [x, y] of l.pts) {
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
-    }
-  if (!lines.length) return { verts: [], edges: [], regions: [] };
-  const diag = Math.hypot(maxX - minX, maxY - minY) || 1;
-
-  // Segments, each collecting the points where it must be split.
-  const sa: Pt[] = [];
-  const sb: Pt[] = [];
-  const sLine: number[] = [];
-  const sIdx: number[] = [];
-  const splits: { t: number; p: Pt }[][] = [];
-  const addSeg = (a: Pt, b: Pt, line: number, idx: number) => {
-    sa.push(a);
-    sb.push(b);
-    sLine.push(line);
-    sIdx.push(idx);
-    splits.push([]);
-    return sa.length - 1;
-  };
-  const lineSegs: number[][] = lines.map((l, li) => {
-    const ids: number[] = [];
-    const n = l.pts.length;
-    for (let i = 0; i < (l.closed ? n : n - 1); i++) ids.push(addSeg(l.pts[i], l.pts[(i + 1) % n], li, i));
-    return ids;
-  });
-
-  // Uniform grid over segments.
-  const cell = diag / 160;
-  const gx = Math.ceil((maxX - minX) / cell) + 3;
-  const gy = Math.ceil((maxY - minY) / cell) + 3;
-  const grid = new Map<number, number[]>();
-  const ci = (x: number) => Math.max(0, Math.min(gx - 1, Math.floor((x - minX) / cell) + 1));
-  const cj = (y: number) => Math.max(0, Math.min(gy - 1, Math.floor((y - minY) / cell) + 1));
-  const insert = (s: number) => {
-    const a = sa[s];
-    const b = sb[s];
-    for (let j = cj(Math.min(a[1], b[1])); j <= cj(Math.max(a[1], b[1])); j++)
-      for (let i = ci(Math.min(a[0], b[0])); i <= ci(Math.max(a[0], b[0])); i++) {
-        const k = j * gx + i;
-        const list = grid.get(k);
-        if (list) list.push(s);
-        else grid.set(k, [s]);
-      }
-  };
-  for (let s = 0; s < sa.length; s++) insert(s);
-
-  // Split every pair of crossing segments at the crossing point.
-  const snap = diag * 1e-7;
-  const near = (p: Pt, q: Pt) => Math.abs(p[0] - q[0]) <= snap * 10 && Math.abs(p[1] - q[1]) <= snap * 10;
-  const stamp = new Int32Array(sa.length).fill(-1);
-  for (let s = 0; s < sa.length; s++) {
-    const a = sa[s];
-    const b = sb[s];
-    for (let j = cj(Math.min(a[1], b[1])); j <= cj(Math.max(a[1], b[1])); j++)
-      for (let i = ci(Math.min(a[0], b[0])); i <= ci(Math.max(a[0], b[0])); i++)
-        for (const o of grid.get(j * gx + i) ?? []) {
-          if (o <= s || stamp[o] === s) continue;
-          stamp[o] = s;
-          if (sLine[o] === sLine[s]) {
-            const n = lineSegs[sLine[s]].length;
-            const d = Math.abs(sIdx[o] - sIdx[s]);
-            if (d === 1 || (lines[sLine[s]].closed && d === n - 1)) continue;
-          }
-          const c = sa[o];
-          const d = sb[o];
-          const rx = b[0] - a[0];
-          const ry = b[1] - a[1];
-          const qx = d[0] - c[0];
-          const qy = d[1] - c[1];
-          const den = rx * qy - ry * qx;
-          if (Math.abs(den) <= 1e-12 * Math.hypot(rx, ry) * Math.hypot(qx, qy)) continue;
-          const t = ((c[0] - a[0]) * qy - (c[1] - a[1]) * qx) / den;
-          const u = ((c[0] - a[0]) * ry - (c[1] - a[1]) * rx) / den;
-          const e = 1e-9;
-          if (t < -e || t > 1 + e || u < -e || u > 1 + e) continue;
-          let p: Pt = [a[0] + t * rx, a[1] + t * ry];
-          // Reuse an existing end point if the crossing is on one, so both segments agree.
-          for (const q of [a, b, c, d]) if (near(p, q)) p = q;
-          splits[s].push({ t, p });
-          splits[o].push({ t: u, p });
-        }
-  }
-
-  // Vertices and unique edges.
-  const verts: Pt[] = [];
-  const ids = new Map<string, number>();
-  const vid = (p: Pt) => {
-    const k = `${Math.round(p[0] / snap)},${Math.round(p[1] / snap)}`;
-    let v = ids.get(k);
-    if (v === undefined) {
-      v = verts.length;
-      verts.push(p);
-      ids.set(k, v);
-    }
-    return v;
-  };
-  const edgeSet = new Set<string>();
-  const edges: [number, number][] = [];
-  for (let s = 0; s < sa.length; s++) {
-    const chain = [sa[s], ...splits[s].sort((x, y) => x.t - y.t).map((x) => x.p), sb[s]].map(vid);
-    for (let k = 1; k < chain.length; k++) {
-      const u = chain[k - 1];
-      const v = chain[k];
-      if (u === v) continue;
-      const key = u < v ? `${u},${v}` : `${v},${u}`;
-      if (edgeSet.has(key)) continue;
-      edgeSet.add(key);
-      edges.push(u < v ? [u, v] : [v, u]);
-    }
-  }
-
+/**
+ * Enclosed areas of a line graph, with drawings nested inside an area as its holes.
+ * Default fill: inside an odd number of the file's shapes; away from shapes,
+ * inside an odd number of band outlines (bands passing under a shape don't count).
+ */
+function findRegions(
+  verts: Pt[],
+  edges: [number, number][],
+  outlines: { shapes: Pt[][]; bands: Pt[][] },
+  diag: number,
+  bboxArea: number,
+): Region[] {
   const nv = verts.length;
   const adj: number[][] = Array.from({ length: nv }, () => []);
   edges.forEach(([u, v], e) => {
     adj[u].push(e);
     adj[v].push(e);
   });
-
-  // Drop tiny stubs where a line overshoots the one it ends on, so they don't get nails.
-  const removed = new Uint8Array(edges.length);
-  for (let v0 = 0; v0 < nv; v0++) {
-    if (adj[v0].length !== 1) continue;
-    const path: number[] = [];
-    let v = v0;
-    let len = 0;
-    let prev = -1;
-    while (len < stub) {
-      const e = adj[v].find((x) => x !== prev);
-      if (e === undefined) break;
-      const [a, b] = edges[e];
-      const w = a === v ? b : a;
-      len += Math.hypot(verts[w][0] - verts[v][0], verts[w][1] - verts[v][1]);
-      path.push(e);
-      prev = e;
-      v = w;
-      if (adj[v].length !== 2) break;
-    }
-    if (len < stub && adj[v].length > 2) for (const e of path) removed[e] = 1;
-  }
-  if (removed.some((x) => x)) {
-    const kept = edges.filter((_, e) => !removed[e]);
-    edges.length = 0;
-    edges.push(...kept);
-    adj.forEach((l) => (l.length = 0));
-    edges.forEach(([u, v], e) => {
-      adj[u].push(e);
-      adj[v].push(e);
-    });
-  }
 
   // Regions only come from cycles, so peel off loose ends first.
   const alive = new Uint8Array(edges.length).fill(1);
@@ -297,7 +347,6 @@ export function buildArrangement(lines: Line[], stub: number): Arrangement {
   });
 
   const ringPts = (ring: number[]) => ring.map((v) => verts[v]);
-  const bboxArea = (maxX - minX) * (maxY - minY);
   const minArea = Math.max(bboxArea * 1e-6, 1e-12);
   const bounded: { ring: number[]; pts: Pt[]; area: number; comp: number; holes: number[][] }[] = [];
   const outer: { ring: number[]; comp: number }[] = [];
@@ -317,23 +366,24 @@ export function buildArrangement(lines: Line[], stub: number): Arrangement {
     host?.holes.push(o.ring);
   }
 
-  const closedLines = lines.filter((l) => l.closed).map((l) => l.pts);
-  const regions: (Region & { top: number; left: number })[] = bounded.map((b) => {
+  const regions = bounded.map((b) => {
     const rings = [b.ring, ...b.holes];
     const pts = rings.map(ringPts);
-    const [sx, sy] = interiorPoint(pts);
-    const inside = closedLines.reduce((n, l) => n + (pointInPolygon(sx, sy, l) ? 1 : 0), 0);
+    const sample = interiorPoint(pts);
+    const count = (list: Pt[][]) => list.reduce((n, l) => n + (pointInPolygon(sample[0], sample[1], l) ? 1 : 0), 0);
+    const inShapes = count(outlines.shapes);
+    const inside = inShapes > 0 ? inShapes : count(outlines.bands);
     let top = -Infinity;
     let left = Infinity;
     for (const [x, y] of pts[0]) {
       top = Math.max(top, y);
       left = Math.min(left, x);
     }
-    return { rings, pts, area: b.area, defaultFill: inside % 2 === 1, top, left };
+    return { rings, pts, area: b.area, defaultFill: inside % 2 === 1, sample, top, left };
   });
-  // Stable order (top to bottom, left to right) so saved fill choices keep pointing at the same regions.
+  // Stable order (top to bottom, left to right).
   regions.sort((a, b) => (Math.abs(a.top - b.top) > diag * 1e-4 ? b.top - a.top : a.left - b.left));
-  return { verts, edges, regions: regions.map(({ rings, pts, area, defaultFill }) => ({ rings, pts, area, defaultFill })) };
+  return regions.map(({ rings, pts, area, defaultFill, sample }) => ({ rings, pts, area, defaultFill, sample }));
 }
 
 /** A point well inside a polygon with holes: the middle of the widest horizontal span. */

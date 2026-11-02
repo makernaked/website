@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { edgeToEdge, normalizeDegrees, regularRadius, regularSize } from "./geometry";
 import { exportDXF, exportGcode, exportPDF } from "./io";
 import { patternKey, patternStats } from "./pattern";
-import { artGap, artLineWidth, openLineCount } from "./outline";
+import { artGap, artLineWidth, layerIncluded, openLineCount } from "./outline";
 import { arrangement, isFilled } from "./regions";
 import { groupBounds } from "./render";
 import {
@@ -17,8 +17,13 @@ import {
   reshapeRef,
   rotateSelection,
   select,
+  restoreLines,
+  restoreNails,
+  restoreWidths,
   setAllRegions,
   setArtGap,
+  setArtLayer,
+  setArtLineWeights,
   setArtLineWidth,
   setSelectionBounds,
   setState,
@@ -309,6 +314,7 @@ function ArtProps({ o, units }: { o: Artwork; units: Units }) {
   const k = o.w / o.w0;
   const lines = openLineCount(o);
   const u = unitLabel(units);
+  const weights = [...new Set(o.contours.filter((c) => !c.closed && c.weight).map((c) => c.weight!))].sort((a, b) => b - a);
   return (
     <>
       {lines > 0 && (
@@ -324,12 +330,21 @@ function ArtProps({ o, units }: { o: Artwork; units: Units }) {
               <LengthInput value={artGap(o) * k} units={units} min={0} onCommit={(v) => setArtGap(o.id, v / k)} />
             </Field>
           </Row>
+          {weights.length > 1 && (
+            <Check
+              label={`Scale by the file's line weights (${weights.map((w) => `${Math.round((w / weights[0]) * 100)}%`).join(", ")})`}
+              checked={!!o.lineWeights}
+              onChange={(on) => setArtLineWeights(o.id, on)}
+            />
+          )}
           <p className="text-[11px] text-neutral-500">
-            Line width turns single lines into bands you can fill with string (0 keeps them thin). Close gaps joins line ends that stop just
-            short of another line. Both scale with the artwork.
+            Line width turns single lines into bands you can fill with string (0 keeps them thin).
+            {weights.length > 1 ? " With line weights on, it's the width of the boldest lines and thinner ones get a share of it." : ""} Close
+            gaps joins line ends that stop just short of another line. Both scale with the artwork.
           </p>
         </>
       )}
+      <LayerList o={o} units={units} />
       <Row>
         <Field label="Scale (%)">
           <NumberInput value={scale} min={0.1} digits={1} onCommit={(p) => updateObject(o.id, { w: (o.w0 * p) / 100, h: (o.h0 * p) / 100 })} />
@@ -345,6 +360,73 @@ function ArtProps({ o, units }: { o: Artwork; units: Units }) {
         {o.contours.length === 1 ? "" : "s"}
       </p>
     </>
+  );
+}
+
+/** Per-layer include and line width, for artwork imported with layers. */
+function LayerList({ o, units }: { o: Artwork; units: Units }) {
+  const stats = new Map<string, { open: number; shapes: number }>();
+  for (const c of o.contours) {
+    const s = stats.get(c.layer ?? "") ?? { open: 0, shapes: 0 };
+    if (c.closed) s.shapes++;
+    else s.open++;
+    stats.set(c.layer ?? "", s);
+  }
+  if (stats.size < 2) return null;
+  const k = o.w / o.w0;
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  return (
+    <div className="space-y-1 pt-1">
+      <p className="text-xs text-neutral-400">Layers</p>
+      {[...stats].map(([name, s]) => {
+        const settings = o.layers?.[name];
+        const included = layerIncluded(o, name || undefined);
+        return (
+          <div key={name} className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              className="accent-amber-500"
+              title={included ? "Leave this layer out" : "Use this layer"}
+              disabled={!name}
+              checked={included}
+              onChange={(e) => setArtLayer(o.id, name, { include: e.target.checked })}
+            />
+            <span className={`min-w-0 flex-1 truncate text-sm ${included ? "text-neutral-200" : "text-neutral-500 line-through"}`}>
+              {name || "(no layer)"}
+              <span className="ml-1.5 text-[11px] text-neutral-500 no-underline">
+                {[s.open && plural(s.open, "line"), s.shapes && plural(s.shapes, "shape")].filter(Boolean).join(", ")}
+              </span>
+            </span>
+            {!!name && s.open > 0 && included && (
+              <div className="flex w-24 shrink-0 items-center gap-0.5" title="Line width for this layer (blank uses the artwork's)">
+                <LengthInput
+                  value={settings?.lineWidth !== undefined ? settings.lineWidth * k : null}
+                  placeholder="width"
+                  units={units}
+                  min={0}
+                  onCommit={(v) => setArtLayer(o.id, name, { lineWidth: v / k })}
+                />
+                {settings?.lineWidth !== undefined && (
+                  <button
+                    type="button"
+                    className="px-0.5 text-neutral-500 hover:text-neutral-200"
+                    title="Use the artwork's line width"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setArtLayer(o.id, name, { lineWidth: undefined })}
+                  >
+                    ↺
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <p className="text-[11px] text-neutral-500">
+        Untick a layer to leave it out (no nails or regions; it stays as a faint guide). A layer&apos;s width overrides the artwork&apos;s line
+        width for its single lines.
+      </p>
+    </div>
   );
 }
 
@@ -385,7 +467,7 @@ function NailsPanel() {
   const u = unitLabel(units);
   const perUnitBase = units === "in" ? MM_PER_IN : 10;
 
-  const picking = useEditor((s) => s.pickRegions);
+  const pickMode = useEditor((s) => s.pickMode);
   const selection = useEditor((s) => s.selection);
   const regionCount = useMemo(() => {
     let total = 0;
@@ -397,9 +479,15 @@ function NailsPanel() {
         if (isFilled(o, i)) filled++;
       });
     }
-    return { total, filled };
+    const count = (pick: (a: Artwork) => number) => objects.reduce((n, o) => n + (o.type === "art" ? pick(o) : 0), 0);
+    const removed = count((a) => a.cuts?.length ?? 0);
+    const removedNails = count((a) => a.removedNails?.length ?? 0);
+    const painted = count((a) => a.widths?.length ?? 0);
+    return { total, filled, removed, removedNails, painted };
   }, [objects]);
   const artSelected = objects.some((o) => o.type === "art" && selection.includes(o.id));
+  const paintWidth = useEditor((s) => s.paintWidth);
+  const toggleMode = (mode: NonNullable<typeof pickMode>) => setState({ pickMode: pickMode === mode ? null : mode });
   const set = (patch: Partial<PatternSettings>) => setState((s) => ({ settings: { ...s.settings, ...patch } }));
   const show = (patch: Partial<typeof display>) => setState((s) => ({ display: { ...s.display, ...patch } }));
   const calculate = () => {
@@ -449,13 +537,48 @@ function NailsPanel() {
       </Section>
 
       {hasArt && (
-        <Section title="Regions">
+        <Section title="Regions & lines">
           <p className="text-sm text-neutral-300">
             {regionCount.filled} of {regionCount.total} region{regionCount.total === 1 ? "" : "s"} filled with string
           </p>
-          <Btn variant={picking ? "primary" : "default"} className="w-full" onClick={() => setState({ pickRegions: !picking })}>
-            {picking ? "Done picking" : "Pick regions on the canvas"}
-          </Btn>
+          <div className="grid grid-cols-2 gap-1">
+            <Btn variant={pickMode === "regions" ? "primary" : "default"} onClick={() => toggleMode("regions")}>
+              {pickMode === "regions" ? "Done" : "Pick regions"}
+            </Btn>
+            <Btn
+              variant={pickMode === "widths" ? "primary" : "default"}
+              title="Click pieces of single line to give them their own width"
+              onClick={() => toggleMode("widths")}
+            >
+              {pickMode === "widths" ? "Done" : "Line widths"}
+            </Btn>
+            <Btn
+              variant={pickMode === "lines" ? "primary" : "default"}
+              title="Click a line to drop its nails and join the regions on either side"
+              onClick={() => toggleMode("lines")}
+            >
+              {pickMode === "lines" ? "Done" : "Remove lines"}
+            </Btn>
+            <Btn
+              variant={pickMode === "nails" ? "primary" : "default"}
+              title="Click nails from the last calculation to take them out"
+              disabled={!pattern?.nails.length}
+              onClick={() => toggleMode("nails")}
+            >
+              {pickMode === "nails" ? "Done" : "Remove nails"}
+            </Btn>
+          </div>
+          {pickMode === "widths" && (
+            <div className="space-y-1 rounded border border-amber-500/40 bg-amber-500/5 p-2">
+              <Field label={`Width to give (${u}) · 0 = thin line`}>
+                <LengthInput value={paintWidth} units={units} min={0} onCommit={(v) => setState({ paintWidth: v })} />
+              </Field>
+              <p className="text-[11px] text-neutral-400">
+                Click a piece of line to give it this width; click it again to go back to its layer&apos;s width. Shift-click takes the whole
+                drawn line.
+              </p>
+            </div>
+          )}
           <div className="grid grid-cols-3 gap-1">
             <Btn onClick={() => setAllRegions(true)}>Fill all</Btn>
             <Btn onClick={() => setAllRegions(false)}>Clear all</Btn>
@@ -463,8 +586,33 @@ function NailsPanel() {
               Reset
             </Btn>
           </div>
+          {regionCount.removed > 0 && (
+            <div className="flex items-center justify-between text-xs text-neutral-400">
+              <span>
+                {regionCount.removed} line{regionCount.removed === 1 ? "" : "s"} removed (dashed red)
+              </span>
+              <Btn onClick={restoreLines}>Restore</Btn>
+            </div>
+          )}
+          {regionCount.painted > 0 && (
+            <div className="flex items-center justify-between text-xs text-neutral-400">
+              <span>
+                {regionCount.painted} piece{regionCount.painted === 1 ? "" : "s"} with their own width
+              </span>
+              <Btn onClick={restoreWidths}>Restore</Btn>
+            </div>
+          )}
+          {regionCount.removedNails > 0 && (
+            <div className="flex items-center justify-between text-xs text-neutral-400">
+              <span>
+                {regionCount.removedNails} nail{regionCount.removedNails === 1 ? "" : "s"} removed (crossed out)
+              </span>
+              <Btn onClick={restoreNails}>Restore</Btn>
+            </div>
+          )}
           <p className="text-[11px] text-neutral-500">
-            Regions are the areas enclosed by your lines. Each filled region gets its own string.
+            Regions are the areas enclosed by your lines. Each filled region gets its own string. Removing a line drops its nails and joins
+            the regions on either side.
             {artSelected ? " Buttons apply to the selected artwork." : ""}
           </p>
         </Section>

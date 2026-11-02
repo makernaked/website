@@ -16,6 +16,19 @@ export interface Bounds {
 export interface Contour {
   pts: number[];
   closed: boolean;
+  /** Layer it was drawn on in the source file. */
+  layer?: string;
+  /** Stroke width in the source file (mm); only meaningful relative to other lines. */
+  weight?: number;
+  /** A closed shape that's filled in the source file, so it hides what was drawn before it. */
+  filled?: boolean;
+}
+
+export interface LayerSettings {
+  /** false leaves the layer out: no nails or regions (it stays visible as a guide). */
+  include?: boolean;
+  /** Width for this layer's single lines (local units), instead of the artwork's. */
+  lineWidth?: number;
 }
 
 interface ObjBase {
@@ -49,8 +62,18 @@ export interface Artwork extends ObjBase {
   gap?: number;
   /** Width given to open lines (local units); 0 keeps them as thin lines. */
   lineWidth?: number;
-  /** Per-region fill overrides, by region index. */
-  fill?: Record<number, boolean>;
+  /** Scale each line's width by its stroke width in the file, relative to the widest. */
+  lineWeights?: boolean;
+  /** Per-layer settings, by layer name. */
+  layers?: Record<string, LayerSettings>;
+  /** Region fill choices, each saved as a point inside the region (artwork units). */
+  fills?: { at: Pt; on: boolean }[];
+  /** Removed line pieces (no nails; regions either side join), each saved as a point on the piece. */
+  cuts?: Pt[];
+  /** Widths painted onto pieces of single lines, each saved as a point on the piece (artwork units). */
+  widths?: { at: Pt; width: number }[];
+  /** Nails the user took out, by position in the artwork's own (unscaled) coordinates. */
+  removedNails?: Pt[];
 }
 
 export type Obj = RefShape | Artwork;
@@ -71,6 +94,8 @@ export interface Nail {
   y: number;
   label: string;
   corner: boolean;
+  /** Id of the artwork the nail belongs to. */
+  art?: string;
 }
 
 export interface Island {

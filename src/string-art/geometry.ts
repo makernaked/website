@@ -59,6 +59,17 @@ export function toLocal(o: Obj, x: number, y: number): Pt {
   return [dx * c - dy * s, dx * s + dy * c];
 }
 
+/** Artwork's own unscaled coordinates (as imported) to world. */
+export function artToWorld(a: Artwork, x: number, y: number): Pt {
+  return toWorld(a, x * (a.w0 > 0 ? a.w / a.w0 : 1), y * (a.h0 > 0 ? a.h / a.h0 : 1));
+}
+
+/** World to the artwork's own unscaled coordinates. */
+export function worldToArt(a: Artwork, x: number, y: number): Pt {
+  const [lx, ly] = toLocal(a, x, y);
+  return [lx / (a.w0 > 0 ? a.w / a.w0 : 1), ly / (a.h0 > 0 ? a.h / a.h0 : 1)];
+}
+
 /** Corners of the object's rotated box, in world coordinates. */
 export function orientedCorners(o: Obj): Pt[] {
   return [

@@ -96,18 +96,28 @@ function bspline(degree: number, ctrl: Pt[], knots: number[], samples: number): 
   return pts;
 }
 
-/** Joins loose segments whose endpoints meet into longer chains, closing loops where possible. */
-function chainPieces(pieces: Pt[][], tol: number): RawContour[] {
-  const out: RawContour[] = [];
-  const left = pieces.filter((p) => p.length >= 2);
+/** `order` is the entity's position in the file (its drawing order). */
+type Meta = { layer?: string; weight?: number; order?: number };
+type Piece = Meta & { pts: Pt[] };
+
+/**
+ * Joins loose segments on the same layer whose endpoints meet into longer
+ * chains, closing loops where possible.
+ */
+function chainPieces(pieces: Piece[], tol: number): (RawContour & Meta)[] {
+  const out: (RawContour & Meta)[] = [];
+  const left = pieces.filter((p) => p.pts.length >= 2);
   const close = (a: Pt, b: Pt) => Math.abs(a[0] - b[0]) <= tol && Math.abs(a[1] - b[1]) <= tol;
   while (left.length) {
-    let chain = left.pop()!;
+    const first = left.pop()!;
+    let chain = first.pts;
+    let order = first.order ?? 0;
     let grew = true;
     while (grew && !close(chain[0], chain[chain.length - 1])) {
       grew = false;
       for (let i = 0; i < left.length; i++) {
-        const p = left[i];
+        if (left[i].layer !== first.layer) continue;
+        const p = left[i].pts;
         const end = chain[chain.length - 1];
         const start = chain[0];
         if (close(end, p[0])) chain = chain.concat(p.slice(1));
@@ -115,6 +125,7 @@ function chainPieces(pieces: Pt[][], tol: number): RawContour[] {
         else if (close(start, p[p.length - 1])) chain = p.slice(0, -1).concat(chain);
         else if (close(start, p[0])) chain = p.slice(1).reverse().concat(chain);
         else continue;
+        order = Math.min(order, left[i].order ?? 0);
         left.splice(i, 1);
         grew = true;
         break;
@@ -122,7 +133,7 @@ function chainPieces(pieces: Pt[][], tol: number): RawContour[] {
     }
     const closed = chain.length > 2 && close(chain[0], chain[chain.length - 1]);
     if (closed) chain = chain.slice(0, -1);
-    out.push({ pts: chain, closed });
+    out.push({ pts: chain, closed, layer: first.layer, weight: first.weight, order });
   }
   return out;
 }
@@ -138,15 +149,19 @@ export function importDXF(text: string, fallbackUnits: Units): ImportResult {
   const scale = INSUNITS_MM[insUnits] ?? (fallbackUnits === "in" ? MM_PER_IN : 1);
   if (!INSUNITS_MM[insUnits]) warnings.push(`The DXF doesn't say what units it uses, so ${fallbackUnits === "in" ? "inches" : "millimetres"} were assumed.`);
 
-  const closedOut: RawContour[] = [];
-  const pieces: Pt[][] = [];
+  const closedOut: (RawContour & Meta)[] = [];
+  const pieces: Piece[] = [];
   const skipped = new Set<string>();
+  let meta: Meta = {};
 
+  // DXF has no fill for plain outlines; a closed outline without a line weight is
+  // how filled shapes come through (Illustrator exports them that way).
   const emit = (pts: Pt[], closed: boolean, xf: Xf) => {
     const t = pts.map(xf);
-    if (closed) closedOut.push({ pts: t, closed: true });
-    else pieces.push(t);
+    if (closed) closedOut.push({ pts: t, closed: true, ...meta, filled: meta.weight === undefined });
+    else pieces.push({ pts: t, ...meta });
   };
+  let entityOrder = 0;
 
   // Entities with an extrusion of (0,0,-1) are mirrored in X.
   const ocs = (e: { extrusionDirectionZ?: number; extrusionDirection?: { z: number } }, xf: Xf): Xf => {
@@ -154,8 +169,15 @@ export function importDXF(text: string, fallbackUnits: Units): ImportResult {
     return z < 0 ? ([x, y]) => xf([-x, y]) : xf;
   };
 
-  const handle = (e: IEntity, xf: Xf, depth: number) => {
+  // Inside a block, layer "0" and by-block line weights take the inserting entity's.
+  const handle = (e: IEntity, xf: Xf, depth: number, parent: Meta = {}) => {
     if (e.inPaperSpace || e.visible === false) return;
+    const lw = e.lineweight as number | undefined;
+    meta = {
+      layer: e.layer && e.layer !== "0" ? e.layer : (parent.layer ?? e.layer),
+      weight: lw !== undefined && lw > 0 ? lw / 100 : lw === -2 ? parent.weight : undefined,
+      order: entityOrder++,
+    };
     switch (e.type) {
       case "LINE": {
         const l = e as ILineEntity;
@@ -224,7 +246,8 @@ export function importDXF(text: string, fallbackUnits: Units): ImportResult {
           const ly = (y - by) * sy;
           return xf([ins.position.x + lx * cr - ly * sr, ins.position.y + lx * sr + ly * cr]);
         };
-        for (const be of block.entities ?? []) handle(be, inner, depth + 1);
+        const outer = meta;
+        for (const be of block.entities ?? []) handle(be, inner, depth + 1, outer);
         break;
       }
       default:
@@ -240,7 +263,7 @@ export function importDXF(text: string, fallbackUnits: Units): ImportResult {
   let maxX = -Infinity;
   let minY = Infinity;
   let maxY = -Infinity;
-  for (const c of [...closedOut.map((c) => c.pts), ...pieces])
+  for (const c of [...closedOut, ...pieces].map((c) => c.pts))
     for (const [x, y] of c) {
       minX = Math.min(minX, x);
       maxX = Math.max(maxX, x);
@@ -248,5 +271,12 @@ export function importDXF(text: string, fallbackUnits: Units): ImportResult {
       maxY = Math.max(maxY, y);
     }
   const diag = Math.hypot(maxX - minX, maxY - minY) || 1;
-  return { contours: [...closedOut, ...chainPieces(pieces, diag * 1e-5)], warnings };
+  const hiddenLayers = Object.values(dxf.tables?.layer?.layers ?? {})
+    .filter((l) => l.visible === false || l.frozen)
+    .map((l) => l.name);
+  // Keep the file's drawing order: later shapes sit on top of earlier ones.
+  const contours = [...closedOut, ...chainPieces(pieces, diag * 1e-5)]
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    .map(({ pts, closed, layer, weight, filled }) => ({ pts, closed, layer, weight, filled }));
+  return { contours, warnings, hiddenLayers };
 }

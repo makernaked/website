@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { distToSegment, normalizeDegrees, objBounds, pointInPolygon, rotateObj, toLocal, unionBounds, worldContours } from "./geometry";
+import { artToWorld, distToSegment, normalizeDegrees, objBounds, pointInPolygon, rotateObj, toLocal, unionBounds, worldContours } from "./geometry";
 import { importFiles } from "./io";
 import { patternKey } from "./pattern";
-import { regionAt } from "./regions";
+import { chainLines, thinGraph } from "./outline";
+import { regionAt, worldChainAt, worldChains, worldThinChains } from "./regions";
 import {
   drawScene,
   groupBounds,
@@ -37,11 +38,14 @@ import {
   setObjects,
   setState,
   subscribe,
+  paintLineWidth,
+  toggleLine,
+  toggleNail,
   toggleRegion,
   undo,
   useEditor,
 } from "./store";
-import type { Bounds, Obj } from "./types";
+import type { Artwork, Bounds, Obj } from "./types";
 import { formatLength, MM_PER_IN } from "./units";
 import { fit, getView, home, setCanvasSize, setView, subscribeView, zoomAt } from "./view";
 
@@ -73,12 +77,12 @@ export default function CanvasView() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const statusRef = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
-  const overlay = useRef<Overlay>({ marquee: null, cursor: null, patternStale: false, angle: null, hoverRegion: null });
+  const overlay = useRef<Overlay>({ marquee: null, cursor: null, patternStale: false, angle: null, hoverRegion: null, hoverLine: null, hoverNail: null, hoverPiece: null });
   const space = useRef(false);
   const size = useRef({ w: 0, h: 0 });
   const frame = useRef(0);
   const [dropping, setDropping] = useState(false);
-  const picking = useEditor((s) => s.pickRegions);
+  const pickMode = useEditor((s) => s.pickMode);
 
   useEffect(() => {
     const canvas = canvasRef.current!;
@@ -91,7 +95,10 @@ export default function CanvasView() {
       if (!w || !h) return;
       const s = getState();
       overlay.current.patternStale = !!s.pattern && s.pattern.key !== patternKey(s.objects, s.settings);
-      if (!s.pickRegions) overlay.current.hoverRegion = null;
+      if (s.pickMode !== "regions") overlay.current.hoverRegion = null;
+      if (s.pickMode !== "lines") overlay.current.hoverLine = null;
+      if (s.pickMode !== "widths") overlay.current.hoverPiece = null;
+      if (s.pickMode !== "nails") overlay.current.hoverNail = null;
       const dpr = window.devicePixelRatio || 1;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       drawScene(ctx, s, getView(), w, h, overlay.current);
@@ -202,10 +209,77 @@ export default function CanvasView() {
       return null;
     };
 
+    const lineHit = (sx: number, sy: number) => {
+      const s = getState();
+      const [x, y] = toWorld(sx, sy);
+      const tol = 6 / getView().zoom;
+      for (const o of [...s.objects].reverse()) {
+        if (o.type !== "art") continue;
+        const b = objBounds(o);
+        if (x < b.minX - tol || x > b.maxX + tol || y < b.minY - tol || y > b.maxY + tol) continue;
+        const index = worldChainAt(worldChains(o), x, y, tol);
+        if (index >= 0) return { id: o.id, index };
+      }
+      return null;
+    };
+
+    /** A piece of single line (or the whole drawn line with `whole`) to paint a width onto. */
+    const pieceHit = (sx: number, sy: number, whole: boolean) => {
+      const s = getState();
+      const [x, y] = toWorld(sx, sy);
+      const tol = 6 / getView().zoom;
+      for (const o of [...s.objects].reverse()) {
+        if (o.type !== "art") continue;
+        const b = objBounds(o);
+        if (x < b.minX - tol || x > b.maxX + tol || y < b.minY - tol || y > b.maxY + tol) continue;
+        const index = worldChainAt(worldThinChains(o), x, y, tol);
+        if (index < 0) continue;
+        const lineOf = chainLines(thinGraph(o));
+        const indices = whole ? lineOf.flatMap((l, i) => (l === lineOf[index] ? [i] : [])) : [index];
+        return { id: o.id, index, indices };
+      }
+      return null;
+    };
+
+    /** A removed-nail marker (to put back) or a nail from the last calculation (to remove). */
+    const nailHit = (sx: number, sy: number) => {
+      const s = getState();
+      const [x, y] = toWorld(sx, sy);
+      const zoom = getView().zoom;
+      const within = Math.max(8, (s.settings.nailDiameter / 2) * zoom + 4) / zoom;
+      for (const o of s.objects) {
+        if (o.type !== "art") continue;
+        for (const [lx, ly] of o.removedNails ?? []) {
+          const [wx, wy] = artToWorld(o, lx, ly);
+          if (Math.hypot(wx - x, wy - y) < within) return { id: o.id, x: wx, y: wy };
+        }
+      }
+      let best: { id: string; x: number; y: number } | null = null;
+      let bestD = within;
+      for (const n of s.pattern?.nails ?? []) {
+        const d = Math.hypot(n.x - x, n.y - y);
+        if (d >= bestD) continue;
+        // Older patterns don't record the artwork; fall back to whichever contains the nail.
+        const id =
+          n.art ??
+          [...s.objects].reverse().find((o) => {
+            const b = objBounds(o);
+            return o.type === "art" && n.x >= b.minX && n.x <= b.maxX && n.y >= b.minY && n.y <= b.maxY;
+          })?.id;
+        if (!id) continue;
+        bestD = d;
+        best = { id, x: n.x, y: n.y };
+      }
+      return best;
+    };
+
     const setCursor = (sx: number, sy: number) => {
       if (drag.current) return;
       if (space.current) canvas.style.cursor = "grab";
-      else if (getState().pickRegions) canvas.style.cursor = overlay.current.hoverRegion ? "pointer" : "default";
+      else if (getState().pickMode === "regions") canvas.style.cursor = overlay.current.hoverRegion ? "pointer" : "default";
+      else if (getState().pickMode === "lines") canvas.style.cursor = overlay.current.hoverLine ? "pointer" : "default";
+      else if (getState().pickMode === "nails") canvas.style.cursor = overlay.current.hoverNail ? "pointer" : "default";
+      else if (getState().pickMode === "widths") canvas.style.cursor = overlay.current.hoverPiece ? "pointer" : "default";
       else {
         const hi = hitHandle(sx, sy);
         canvas.style.cursor = hitRotate(sx, sy) ? "grab" : hi >= 0 ? HANDLE_CURSORS[hi] : hitObject(sx, sy) ? "move" : "default";
@@ -222,9 +296,27 @@ export default function CanvasView() {
         return;
       }
       if (e.button !== 0 || sx < RULER || sy < RULER) return;
-      if (getState().pickRegions) {
+      const mode = getState().pickMode;
+      if (mode === "regions") {
         const hit = regionHit(sx, sy);
         if (hit) toggleRegion(hit.id, hit.index);
+        return;
+      }
+      if (mode === "lines") {
+        const hit = lineHit(sx, sy);
+        if (hit) toggleLine(hit.id, hit.index);
+        return;
+      }
+      if (mode === "nails") {
+        const hit = nailHit(sx, sy);
+        if (hit) toggleNail(hit.id, hit.x, hit.y);
+        return;
+      }
+      if (mode === "widths") {
+        const hit = pieceHit(sx, sy, e.shiftKey);
+        const art = hit && getState().objects.find((o): o is Artwork => o.id === hit.id && o.type === "art");
+        // The painted width is in world units; artwork stores its own (unscaled) units.
+        if (hit && art) paintLineWidth(hit.id, hit.index, getState().paintWidth / (art.w0 > 0 ? art.w / art.w0 : 1), e.shiftKey);
         return;
       }
       const [wx, wy] = toWorld(sx, sy);
@@ -270,7 +362,11 @@ export default function CanvasView() {
       overlay.current.cursor = [wx, wy];
       const d = drag.current;
       if (!d) {
-        if (getState().pickRegions) overlay.current.hoverRegion = regionHit(sx, sy);
+        const mode = getState().pickMode;
+        if (mode === "regions") overlay.current.hoverRegion = regionHit(sx, sy);
+        if (mode === "lines") overlay.current.hoverLine = lineHit(sx, sy);
+        if (mode === "nails") overlay.current.hoverNail = nailHit(sx, sy);
+        if (mode === "widths") overlay.current.hoverPiece = pieceHit(sx, sy, e.shiftKey);
         setCursor(sx, sy);
         requestDraw();
         return;
@@ -425,7 +521,7 @@ export default function CanvasView() {
       else if (!mod && k === "r") rotateSelection(e.shiftKey ? -15 : 15);
       else if (e.key === "Delete" || e.key === "Backspace") deleteSelection();
       else if (e.key === "Escape") {
-        if (s.pickRegions) setState({ pickRegions: false });
+        if (s.pickMode) setState({ pickMode: null });
         else select([]);
       }
       else if (e.key.startsWith("Arrow") && s.selection.length) {
@@ -491,13 +587,19 @@ export default function CanvasView() {
         ref={statusRef}
         className="pointer-events-none absolute right-2 bottom-2 rounded bg-black/60 px-2 py-0.5 font-mono text-[11px] text-neutral-400"
       />
-      {picking && (
+      {pickMode && (
         <div className="absolute top-8 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full border border-amber-500/50 bg-neutral-950/90 py-1 pr-1 pl-4 text-sm text-amber-100 shadow-lg">
-          Click regions to fill or clear them
+          {pickMode === "regions"
+            ? "Click regions to fill or clear them"
+            : pickMode === "lines"
+              ? "Click a line to remove it (no nails, regions join) or put it back"
+              : pickMode === "widths"
+                ? "Click a piece of line to give it the width (again to undo) · Shift-click for the whole line"
+                : "Click a nail to remove it, or a crossed-out one to put it back"}
           <button
             type="button"
             onMouseDown={(e) => e.preventDefault()}
-            onClick={() => setState({ pickRegions: false })}
+            onClick={() => setState({ pickMode: null })}
             className="rounded-full bg-amber-500 px-3 py-0.5 text-sm font-medium text-neutral-950 hover:bg-amber-400"
           >
             Done

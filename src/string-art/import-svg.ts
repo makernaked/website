@@ -5,11 +5,18 @@ import { MM_PER_IN } from "./units";
 export interface RawContour {
   pts: Pt[];
   closed: boolean;
+  layer?: string;
+  /** Stroke width in mm, if the shape is stroked. */
+  weight?: number;
+  /** Closed and filled in the file. */
+  filled?: boolean;
 }
 
 export interface ImportResult {
   contours: RawContour[];
   warnings: string[];
+  /** Layers hidden in the source file; they start out left out. */
+  hiddenLayers?: string[];
 }
 
 type Seg = { t: "L"; p: Pt } | { t: "C"; c1: Pt; c2: Pt; p: Pt } | { t: "Q"; c: Pt; p: Pt };
@@ -17,6 +24,9 @@ interface SubPath {
   start: Pt;
   segs: Seg[];
   closed: boolean;
+  layer?: string;
+  weight?: number;
+  filled?: boolean;
 }
 
 const SKIP = new Set(["defs", "clipPath", "mask", "symbol", "marker", "pattern", "metadata", "title", "desc", "style", "script", "linearGradient", "radialGradient", "filter"]);
@@ -41,13 +51,24 @@ function lengthToMM(v: string | null): number | null {
 
 const num = (el: Element, name: string) => parseFloat(el.getAttribute(name) ?? "0") || 0;
 
-function isHidden(el: Element): boolean {
-  const style = el.getAttribute("style") ?? "";
+/** Millimetres per user unit under a transform (geometric mean of the axis scales). */
+function transformScale(transform: string): number {
+  let len = 1;
+  svgpath("M0 0L1 0M0 0L0 1")
+    .transform(transform)
+    .abs()
+    .iterate((seg, _i, x, y) => {
+      if (seg[0] === "L") len *= Math.hypot(seg[1] - x, seg[2] - y);
+    });
+  return Math.sqrt(len);
+}
+
+/** A group's name as an editor would show it: Inkscape label, Illustrator data-name, or id. */
+function groupLabel(el: Element): string | null {
   return (
-    el.getAttribute("display") === "none" ||
-    el.getAttribute("visibility") === "hidden" ||
-    /display\s*:\s*none/.test(style) ||
-    /visibility\s*:\s*hidden/.test(style)
+    el.getAttributeNS("http://www.inkscape.org/namespaces/inkscape", "label") ??
+    el.getAttribute("data-name") ??
+    el.getAttribute("id")
   );
 }
 
@@ -201,7 +222,7 @@ export function flattenSubPaths(subs: SubPath[]): RawContour[] {
     const first = pts[0];
     const lastPt = pts[pts.length - 1];
     const closed = s.closed || Math.hypot(first[0] - lastPt[0], first[1] - lastPt[1]) < tol * 2;
-    return { pts, closed };
+    return { pts, closed, layer: s.layer, weight: s.weight, filled: closed && s.filled };
   });
 }
 
@@ -227,8 +248,21 @@ export function importSVG(text: string): ImportResult {
   let skippedText = 0;
   let skippedImages = 0;
 
-  const walk = (el: Element, transform: string, depth: number) => {
-    if (depth > 64 || isHidden(el)) return;
+  // Work on a live (hidden) copy so computed styles resolve CSS classes and inheritance.
+  const host = document.createElement("div");
+  // Off-screen rather than visibility:hidden, which every element would inherit.
+  host.style.cssText = "position:absolute;left:-10000px;top:0;width:0;height:0;overflow:hidden;opacity:0;pointer-events:none";
+  const live = document.importNode(root, true) as unknown as SVGSVGElement;
+  host.appendChild(live);
+  document.body.appendChild(host);
+
+  // Top-level groups are the layers. Skip a single wrapper group around everything.
+  const top = Array.from(live.children).filter((c) => !SKIP.has(c.localName));
+  const layerRoot = top.length === 1 && top[0].localName === "g" && top[0].querySelector(":scope > g") ? top[0] : live;
+
+  const walk = (el: Element, transform: string, depth: number, layer: string | undefined) => {
+    const cs = getComputedStyle(el);
+    if (depth > 64 || cs.display === "none" || cs.visibility === "hidden") return;
     const name = el.localName;
     if (SKIP.has(name)) return;
     if (name === "text") {
@@ -242,32 +276,41 @@ export function importSVG(text: string): ImportResult {
     const t = `${transform} ${el.getAttribute("transform") ?? ""}`;
     if (name === "use") {
       const href = el.getAttribute("href") ?? el.getAttributeNS("http://www.w3.org/1999/xlink", "href") ?? "";
-      const target = href.startsWith("#") ? doc.querySelector(`[id="${CSS.escape(href.slice(1))}"]`) : null;
+      const target = href.startsWith("#") ? live.querySelector(`[id="${CSS.escape(href.slice(1))}"]`) : null;
       if (target) {
         const ut = `${t} translate(${num(el, "x")} ${num(el, "y")})`;
-        if (target.localName === "symbol") for (const c of Array.from(target.children)) walk(c, ut, depth + 1);
-        else walk(target, ut, depth + 1);
+        if (target.localName === "symbol") for (const c of Array.from(target.children)) walk(c, ut, depth + 1, layer);
+        else walk(target, ut, depth + 1, layer);
       }
       return;
     }
     const d = elementToPath(el);
     if (d) {
       try {
-        subs.push(...parsePathData(d, t));
+        const stroked = cs.stroke && cs.stroke !== "none";
+        const width = parseFloat(cs.strokeWidth);
+        const weight = stroked && width > 0 ? width * transformScale(t) : undefined;
+        const filled = !!cs.fill && cs.fill !== "none" && parseFloat(cs.fillOpacity || "1") > 0;
+        for (const sp of parsePathData(d, t)) subs.push({ ...sp, layer, weight, filled });
       } catch {
         warnings.push("Skipped a path that could not be read.");
       }
     }
-    for (const c of Array.from(el.children)) walk(c, t, depth + 1);
+    const childLayer = el.parentElement === layerRoot && name === "g" ? (groupLabel(el) ?? layer) : layer;
+    for (const c of Array.from(el.children)) walk(c, t, depth + 1, childLayer);
   };
-  for (const c of Array.from(root.children)) walk(c, rootTransform, 0);
+  try {
+    for (const c of Array.from(live.children)) walk(c, rootTransform, 0, undefined);
+  } finally {
+    host.remove();
+  }
 
   if (skippedText) warnings.push(`${skippedText} text element${skippedText > 1 ? "s were" : " was"} skipped. Convert text to paths in your editor.`);
   if (skippedImages) warnings.push("Embedded bitmap images were skipped; only vector shapes are used.");
 
   // SVG is Y-down; the canvas is Y-up.
   const contours = flattenSubPaths(subs).map((c) => ({
-    closed: c.closed,
+    ...c,
     pts: c.pts.map(([x, y]): Pt => [x, -y]),
   }));
   return { contours, warnings };

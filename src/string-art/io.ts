@@ -52,7 +52,7 @@ export async function importFiles(files: File[]) {
         warnings.push(`${file.name}: only SVG and DXF files can be imported.`);
         continue;
       }
-      const art = makeArtwork(file.name.replace(/\.[^.]+$/, ""), result.contours);
+      const art = makeArtwork(file.name.replace(/\.[^.]+$/, ""), result.contours, result.hiddenLayers);
       if (!art) {
         warnings.push(`${file.name}: no shapes found.`);
         continue;

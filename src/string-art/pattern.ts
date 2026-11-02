@@ -1,6 +1,7 @@
-import { dist, polygonArea, toWorld } from "./geometry";
+import { artToWorld, dist, polygonArea, toWorld } from "./geometry";
 import { placeContourNails } from "./nails";
-import { artGap, artLineWidth } from "./outline";
+import { artLineKey } from "./outline";
+import { graphChains } from "./graph";
 import { type Arrangement, arrangement, isFilled, worldRegions } from "./regions";
 import { fillIsland } from "./stringing";
 import type { Artwork, Island, Nail, Obj, Pattern, PatternSettings, Pt } from "./types";
@@ -10,7 +11,7 @@ export function patternKey(objects: Obj[], s: PatternSettings): string {
   const art = objects
     .filter((o): o is Artwork => o.type === "art")
     .map((o) =>
-      [o.id, o.x, o.y, o.w, o.h, o.rotation ?? 0, o.contours.length, artGap(o), artLineWidth(o), JSON.stringify(o.fill ?? {})].join(","),
+      [o.id, o.x, o.y, o.w, o.h, o.rotation ?? 0, o.contours.length, artLineKey(o), JSON.stringify(o.fills ?? []), JSON.stringify(o.cuts ?? []), JSON.stringify(o.removedNails ?? [])].join(","),
     );
   return JSON.stringify([art, s.spacing, s.cornerAngle, s.nailDiameter, s.shading, s.minNails, s.seed]);
 }
@@ -27,45 +28,6 @@ export function islandLabel(i: number): string {
     i = Math.floor((i - 1) / 26);
   }
   return s;
-}
-
-/** Splits a line graph into chains: runs of edges between junctions, or closed loops. */
-function graphChains(nv: number, edges: [number, number][]): { verts: number[]; closed: boolean }[] {
-  const adj: number[][] = Array.from({ length: nv }, () => []);
-  edges.forEach(([u, v], e) => {
-    adj[u].push(e);
-    adj[v].push(e);
-  });
-  const used = new Uint8Array(edges.length);
-  const walk = (start: number, first: number) => {
-    const verts = [start];
-    let v = start;
-    let e = first;
-    for (;;) {
-      used[e] = 1;
-      const [a, b] = edges[e];
-      const w = a === v ? b : a;
-      verts.push(w);
-      if (w === start || adj[w].length !== 2) break;
-      const next = adj[w].find((x) => !used[x]);
-      if (next === undefined) break;
-      v = w;
-      e = next;
-    }
-    return verts;
-  };
-  const out: { verts: number[]; closed: boolean }[] = [];
-  for (let v = 0; v < nv; v++) {
-    if (!adj[v].length || adj[v].length === 2) continue;
-    for (const e of adj[v]) if (!used[e]) out.push({ verts: walk(v, e), closed: false });
-  }
-  for (let e = 0; e < edges.length; e++) {
-    if (used[e]) continue;
-    const verts = walk(edges[e][0], e);
-    verts.pop();
-    out.push({ verts, closed: true });
-  }
-  return out;
 }
 
 const edgeKey = (u: number, v: number) => (u < v ? `${u},${v}` : `${v},${u}`);
@@ -91,7 +53,7 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
 
   // 1. Lines as graphs in world space. Nails go on every line, and a line shared
   //    by two regions shares its nails.
-  const drafts: { x: number; y: number; corner: boolean }[] = [];
+  const drafts: { x: number; y: number; corner: boolean; art: Artwork }[] = [];
   const graphs: ArtGraph[] = [];
   const chains: { g: ArtGraph; verts: number[]; closed: boolean; top: number; left: number }[] = [];
   for (const art of arts) {
@@ -137,7 +99,7 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
   const vertexNail = (g: ArtGraph, v: number, corner: boolean) => {
     if (!g.vertexNail.has(v)) {
       g.vertexNail.set(v, drafts.length);
-      drafts.push({ x: g.world[v][0], y: g.world[v][1], corner });
+      drafts.push({ x: g.world[v][0], y: g.world[v][1], corner, art: g.art });
     }
   };
   for (const c of chains) {
@@ -175,7 +137,7 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
         const list = g.edgeNails.get(k) ?? [];
         list.push({ t: u < v ? t : 1 - t, n: drafts.length });
         g.edgeNails.set(k, list);
-        drafts.push({ x: placed.pts[i][0], y: placed.pts[i][1], corner: placed.corner[i] });
+        drafts.push({ x: placed.pts[i][0], y: placed.pts[i][1], corner: placed.corner[i], art: g.art });
       }
     });
     if (!closed) vertexNail(g, verts[m - 1], true);
@@ -206,12 +168,31 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
     });
   }
   const dropped = drafts.filter((_, i) => !keep[i]).map((d): Pt => [d.x, d.y]);
+
+  // Nails the user removed: each takes out the nearest nail it sits on.
+  const removeWithin = s.spacing * 0.45;
+  for (const art of arts) {
+    for (const [lx, ly] of art.removedNails ?? []) {
+      const [x, y] = artToWorld(art, lx, ly);
+      let best = -1;
+      let bestD = removeWithin;
+      drafts.forEach((d, i) => {
+        if (!keep[i] || d.art !== art) return;
+        const dd = Math.hypot(d.x - x, d.y - y);
+        if (dd < bestD) {
+          bestD = dd;
+          best = i;
+        }
+      });
+      if (best >= 0) keep[best] = 0;
+    }
+  }
   const index = new Int32Array(drafts.length).fill(-1);
   const nails: Nail[] = [];
   drafts.forEach((d, i) => {
     if (!keep[i]) return;
     index[i] = nails.length;
-    nails.push({ x: d.x, y: d.y, corner: d.corner, label: String(nails.length + 1) });
+    nails.push({ x: d.x, y: d.y, corner: d.corner, label: String(nails.length + 1), art: d.art.id });
   });
 
   // 5. The ring of nails around each filled region, then string it with an amount
@@ -246,7 +227,7 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
       totalRegions++;
       if (!isFilled(art, ri)) return;
       const [outer, ...holes] = r.rings.map((ring) => ringNails(g, ring));
-      if (outer.length < 3) {
+      if (outer.length < 2) {
         small.push(worldRegions(art)[ri]);
         return;
       }
@@ -271,12 +252,17 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
   const light: Pt[][][] = [];
   const islands: Island[] = toFill.map((region, i) => {
     const flat = region.rings.flat();
-    let sequence = fillIsland(
-      region.rings.map((ring) => ring.map((n): Pt => [nails[n].x, nails[n].y])),
-      { targetLength: region.target, seed: s.seed + i * 7919 },
-    ).map((k) => flat[k]);
+    const outer = region.rings[0];
+    // A sliver with only two nails on its edge gets a single string between them.
+    const tiny = outer.length === 2;
+    let sequence = tiny
+      ? [...outer]
+      : fillIsland(
+          region.rings.map((ring) => ring.map((n): Pt => [nails[n].x, nails[n].y])),
+          { targetLength: region.target, seed: s.seed + i * 7919 },
+        ).map((k) => flat[k]);
     // Too small to fill: wrap the outline instead.
-    if (sequence.length < 3) sequence = [...region.rings[0], region.rings[0][0]];
+    if (sequence.length < 3 && !tiny) sequence = [...outer, outer[0]];
     let length = 0;
     for (let k = 1; k < sequence.length; k++) {
       const a = nails[sequence[k - 1]];
@@ -284,7 +270,7 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
       length += Math.hypot(a.x - b.x, a.y - b.y);
     }
     // Ran out of distinct nail-to-nail lines before reaching the shading.
-    if (length < region.target * 0.75) light.push(region.world);
+    if (!tiny && length < region.target * 0.75) light.push(region.world);
     return { label: islandLabel(i), nails: [...new Set(flat)], sequence, length };
   });
 

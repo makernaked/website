@@ -1,5 +1,5 @@
-import { objBounds, orientedCorners, worldContours } from "./geometry";
-import { isFilled, worldRegions } from "./regions";
+import { artToWorld, objBounds, orientedCorners, worldContours } from "./geometry";
+import { cutChains, isFilled, worldChains, worldEdges, worldLeftOut, worldRegions, worldThinChains } from "./regions";
 import type { State } from "./store";
 import type { Bounds, Obj, Units } from "./types";
 import { formatInchLabel, MM_PER_IN } from "./units";
@@ -33,6 +33,8 @@ export const COLORS = {
   nail: "#fafafa",
   problem: "#ef4444",
   light: "#facc15",
+  removed: "#f87171",
+  guide: "rgba(212,212,216,0.35)",
 };
 
 export function worldToScreen(v: View, w: number, h: number, x: number, y: number): [number, number] {
@@ -89,6 +91,22 @@ export interface Overlay {
   angle: { deg: number; x: number; y: number } | null;
   /** Region under the cursor while picking regions. */
   hoverRegion: { id: string; index: number } | null;
+  /** Line piece under the cursor while removing lines. */
+  hoverLine: { id: string; index: number } | null;
+  /** Pieces of single line under the cursor while painting widths. */
+  hoverPiece: { id: string; indices: number[] } | null;
+  /** Nail (or removed-nail marker) under the cursor while removing nails. */
+  hoverNail: { x: number; y: number } | null;
+}
+
+function tracePolyline(ctx: CanvasRenderingContext2D, pts: [number, number][], closed: boolean, v: View, w: number, h: number) {
+  ctx.beginPath();
+  pts.forEach(([x, y], k) => {
+    const [sx, sy] = worldToScreen(v, w, h, x, y);
+    if (k === 0) ctx.moveTo(sx, sy);
+    else ctx.lineTo(sx, sy);
+  });
+  if (closed) ctx.closePath();
 }
 
 function tracePath(ctx: CanvasRenderingContext2D, o: Obj, v: View, w: number, h: number) {
@@ -178,10 +196,59 @@ export function drawScene(ctx: CanvasRenderingContext2D, s: State, v: View, w: n
         ctx.fill("evenodd");
       });
       ctx.beginPath();
-      tracePath(ctx, o, v, w, h);
+      const segs = worldEdges(o);
+      for (let i = 0; i < segs.length; i += 4) {
+        const [x1, y1] = worldToScreen(v, w, h, segs[i], segs[i + 1]);
+        const [x2, y2] = worldToScreen(v, w, h, segs[i + 2], segs[i + 3]);
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+      }
       ctx.strokeStyle = COLORS.art;
       ctx.lineWidth = 1;
       ctx.stroke();
+
+      // Layers left out: faint dashed guides.
+      const guides = worldLeftOut(o);
+      if (guides.length) {
+        ctx.beginPath();
+        for (const g of guides) {
+          g.pts.forEach(([x, y], k) => {
+            const [sx, sy] = worldToScreen(v, w, h, x, y);
+            if (k === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          });
+          if (g.closed) ctx.closePath();
+        }
+        ctx.strokeStyle = COLORS.guide;
+        ctx.setLineDash([3, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Removed line pieces: dashed. The one under the cursor is highlighted.
+      const removed = o.cuts?.length ? cutChains(o) : new Set<number>();
+      const hoverIndex = overlay.hoverLine?.id === o.id ? overlay.hoverLine.index : -1;
+      worldChains(o).forEach((c, ci) => {
+        const isRemoved = removed.has(ci);
+        if (!isRemoved && ci !== hoverIndex) return;
+        tracePolyline(ctx, c.pts, c.closed, v, w, h);
+        ctx.strokeStyle = ci === hoverIndex ? COLORS.select : COLORS.removed;
+        ctx.lineWidth = ci === hoverIndex ? 3 : 1.25;
+        ctx.setLineDash(isRemoved ? [5, 4] : []);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      });
+
+      // Pieces about to get a painted width.
+      if (overlay.hoverPiece?.id === o.id) {
+        const pieces = worldThinChains(o);
+        for (const i of overlay.hoverPiece.indices) {
+          tracePolyline(ctx, pieces[i].pts, pieces[i].closed, v, w, h);
+          ctx.strokeStyle = COLORS.select;
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+      }
     }
   }
 
@@ -287,6 +354,31 @@ export function drawScene(ctx: CanvasRenderingContext2D, s: State, v: View, w: n
       ctx.stroke();
     }
     ctx.restore();
+  }
+
+  // Nails the user removed: a crossed-out ring, so they can be found and put back.
+  const markR = Math.max(5, (s.settings.nailDiameter / 2) * v.zoom + 2);
+  ctx.strokeStyle = COLORS.removed;
+  ctx.lineWidth = 1.5;
+  for (const o of s.objects) {
+    if (o.type !== "art" || !o.removedNails) continue;
+    ctx.beginPath();
+    for (const [lx, ly] of o.removedNails) {
+      const [sx, sy] = worldToScreen(v, w, h, ...artToWorld(o, lx, ly));
+      ctx.moveTo(sx + markR, sy);
+      ctx.arc(sx, sy, markR, 0, Math.PI * 2);
+      ctx.moveTo(sx - markR * 0.7, sy + markR * 0.7);
+      ctx.lineTo(sx + markR * 0.7, sy - markR * 0.7);
+    }
+    ctx.stroke();
+  }
+  if (overlay.hoverNail) {
+    const [sx, sy] = worldToScreen(v, w, h, overlay.hoverNail.x, overlay.hoverNail.y);
+    ctx.strokeStyle = COLORS.select;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(sx, sy, markR + 3, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
   // Selection.
