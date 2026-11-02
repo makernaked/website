@@ -632,8 +632,11 @@ function NailsPanel() {
             </div>
           </Field>
         </Row>
+        <Check label="Outline (nail to neighbouring nail)" checked={settings.outline} onChange={(outline) => set({ outline })} />
+        <Check label="Edge pass (every nail to the one two along)" checked={settings.edgePass} onChange={(edgePass) => set({ edgePass })} />
         <p className="text-[11px] text-neutral-500">
-          Shading sets how much string goes into each shape for its area, so big and small shapes come out equally dark.
+          Shading sets how much string goes into each shape for its area, so big and small shapes come out equally dark. The outline and
+          edge pass go around each shape first to crisp up its edge and fill curves and corners; they count towards the shading.
         </p>
         <Btn variant="primary" className="w-full" onClick={calculate} disabled={busy || !hasArt}>
           {busy ? "Calculating…" : pattern ? "Recalculate pattern" : "Calculate pattern"}

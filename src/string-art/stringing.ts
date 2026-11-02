@@ -5,6 +5,10 @@ export interface FillOptions {
   /** Total length of string to lay inside the shape. */
   targetLength: number;
   seed: number;
+  /** First take the string around each edge, nail to neighbouring nail. */
+  outline?: boolean;
+  /** Then around each edge from every nail to the one two along. */
+  edges?: boolean;
 }
 
 /**
@@ -285,7 +289,86 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
   let hops = 0;
   let lines = 0;
   let laid = 0;
+  const lay = (b: number) => {
+    lineCells(cur, b, (c) => {
+      cov[c] += 1;
+    });
+    used.add(Math.min(b, cur) * n + Math.max(b, cur));
+    laid += Math.hypot(nodes[b][0] - nodes[cur][0], nodes[b][1] - nodes[cur][1]);
+    use[cur]++;
+    use[b]++;
+    lines++;
+    seq.push(b);
+    cur = b;
+  };
+  /** Along the boundary to the next nail (follows the drawn edge). */
+  const step = (b: number) => {
+    seq.push(b);
+    cur = b;
+  };
+
+  // Edge passes, before the fill: an outline lap (nail to neighbouring nail), then
+  // every nail to the one two along. They define the edge and fill the corners
+  // and curves between neighbouring nails that long lines miss.
+  if (opts.outline || opts.edges) {
+    rings.forEach((ring, r) => {
+      const len = ring.length;
+      if (len < 3) return;
+      const at = (k: number) => ringStart[r] + (((k % len) + len) % len);
+      let k0: number;
+      if (ringOf[cur] === r) k0 = posInRing[cur];
+      else {
+        // Get onto this ring (a hole) with a line from where the string is.
+        const onto = ring.findIndex((_, k) => visible(cur, at(k)));
+        if (onto < 0) return;
+        lay(at(onto));
+        k0 = onto;
+      }
+      if (opts.outline) for (let k = 1; k <= len; k++) lay(at(k0 + k));
+      if (!opts.edges || len < 5) return;
+      // With an odd number of nails one lap covers every pair; with an even number, two.
+      for (let lap = 0; lap < (len % 2 ? 1 : 2); lap++) {
+        if (lap === 1) step(at(++k0));
+        for (let s = 0; s < (len % 2 ? len : len / 2); s++) {
+          const b = at(k0 + 2 * s + 2);
+          if (visible(cur, b)) lay(b);
+          else {
+            // Inside a concave corner the shortcut would leave the shape: follow the edge.
+            step(at(k0 + 2 * s + 1));
+            step(b);
+          }
+        }
+      }
+    });
+  }
+
+  // Where the shape is narrow (a nail on another part of the edge within 1.5
+  // nail spacings), strings go straight across: the fill takes that line whenever
+  // it reaches the nail. Long lines alone leave thin bands with only diagonals.
+  const across = new Int32Array(n).fill(-1);
+  for (let i = 0; i < n; i++) {
+    let bestD = avgEdge * 1.5;
+    for (const j of nearby(i)) {
+      if (ringOf[j] === ringOf[i]) {
+        const len = rings[ringOf[i]].length;
+        const d = Math.abs(posInRing[i] - posInRing[j]);
+        if (Math.min(d, len - d) < 3) continue;
+      }
+      const d = Math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1]);
+      if (d < bestD && visible(i, j)) {
+        bestD = d;
+        across[i] = j;
+      }
+    }
+  }
+
   for (let guard = 0; laid < opts.targetLength && lines < maxLines && guard < maxLines * 4; guard++) {
+    const p = across[cur];
+    if (p >= 0 && !used.has(Math.min(p, cur) * n + Math.max(p, cur))) {
+      hops = 0;
+      lay(p);
+      continue;
+    }
     let cands = all;
     if (n > sampleSize) {
       // The nearest nails plus a random spread for long lines. In thin shapes
@@ -313,16 +396,7 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
       continue;
     }
     hops = 0;
-    lineCells(cur, best, (c) => {
-      cov[c] += 1;
-    });
-    used.add(Math.min(best, cur) * n + Math.max(best, cur));
-    laid += Math.hypot(nodes[best][0] - nodes[cur][0], nodes[best][1] - nodes[cur][1]);
-    use[cur]++;
-    use[best]++;
-    seq.push(best);
-    cur = best;
-    lines++;
+    lay(best);
   }
   if (hops) seq.length -= hops;
   return seq.length > 1 ? seq : [];

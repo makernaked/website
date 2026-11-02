@@ -86,6 +86,10 @@ export interface PatternSettings {
   shading: number;
   /** Small filled shapes get closer nails to reach at least this many. 0 turns it off. */
   minNails: number;
+  /** Start each shape with string around its edge, nail to neighbouring nail. */
+  outline: boolean;
+  /** Then a pass around its edge, from every nail to the one two along. */
+  edgePass: boolean;
   seed: number;
 }
 

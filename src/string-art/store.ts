@@ -51,6 +51,8 @@ export const DEFAULT_SETTINGS: PatternSettings = {
   nailDiameter: 1.6,
   shading: 4,
   minNails: 12,
+  outline: true,
+  edgePass: true,
   seed: 1,
 };
 

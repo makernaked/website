@@ -13,7 +13,7 @@ export function patternKey(objects: Obj[], s: PatternSettings): string {
     .map((o) =>
       [o.id, o.x, o.y, o.w, o.h, o.rotation ?? 0, o.contours.length, artLineKey(o), JSON.stringify(o.fills ?? []), JSON.stringify(o.cuts ?? []), JSON.stringify(o.removedNails ?? [])].join(","),
     );
-  return JSON.stringify([art, s.spacing, s.cornerAngle, s.nailDiameter, s.shading, s.minNails, s.seed]);
+  return JSON.stringify([art, s.spacing, s.cornerAngle, s.nailDiameter, s.shading, s.minNails, s.outline, s.edgePass, s.seed]);
 }
 
 /** String per unit area (per mm) for each step of the shading setting. */
@@ -259,7 +259,7 @@ export function computePattern(objects: Obj[], s: PatternSettings): Pattern {
       ? [...outer]
       : fillIsland(
           region.rings.map((ring) => ring.map((n): Pt => [nails[n].x, nails[n].y])),
-          { targetLength: region.target, seed: s.seed + i * 7919 },
+          { targetLength: region.target, seed: s.seed + i * 7919, outline: s.outline, edges: s.edgePass },
         ).map((k) => flat[k]);
     // Too small to fill: wrap the outline instead.
     if (sequence.length < 3 && !tiny) sequence = [...outer, outer[0]];
