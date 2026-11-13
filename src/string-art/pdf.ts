@@ -3,8 +3,8 @@ import { worldContours } from "./geometry";
 import { worldEdges } from "./regions";
 import { patternStats } from "./pattern";
 import type { State } from "./store";
-import { PAPERS, planTiles, printBounds, tileLabel, type TilePlan } from "./tiles";
-import type { Bounds } from "./types";
+import { coverBar, PAPERS, planTiles, printBounds, tileLabel, type TilePlan } from "./tiles";
+import type { Bounds, Nail } from "./types";
 import { formatLengthWithUnit, formatLongLength, MM_PER_IN } from "./units";
 
 /** Liang–Barsky segment clipping. */
@@ -34,6 +34,101 @@ function clip(x0: number, y0: number, x1: number, y1: number, b: Bounds): [numbe
 
 type RGB = [number, number, number];
 
+interface Label {
+  box: Bounds;
+  size: number;
+}
+
+/**
+ * Where each nail's number goes, in world units (the text sits on the box's
+ * bottom edge): the first spot around the nail clear of outlines, nail marks
+ * and numbers already placed, trying beside the nail, then a little further
+ * out, then smaller text; failing that, the least crowded spot.
+ */
+function placeLabels(doc: jsPDF, nails: Nail[], lines: ArrayLike<number>[], nailR: number, arm: number): Label[] {
+  const cell = 5;
+  const grid = new Map<string, { segs: number[]; nails: number[]; boxes: Bounds[] }>();
+  const at = (i: number, j: number) => {
+    const k = `${i},${j}`;
+    let c = grid.get(k);
+    if (!c) grid.set(k, (c = { segs: [], nails: [], boxes: [] }));
+    return c;
+  };
+  const cells = (b: Bounds, visit: (c: ReturnType<typeof at>) => void) => {
+    for (let i = Math.floor(b.minX / cell); i <= Math.floor(b.maxX / cell); i++)
+      for (let j = Math.floor(b.minY / cell); j <= Math.floor(b.maxY / cell); j++) visit(at(i, j));
+  };
+  const segs: number[] = [];
+  const addSeg = (x0: number, y0: number, x1: number, y1: number) => {
+    const k = segs.length;
+    segs.push(x0, y0, x1, y1);
+    cells({ minX: Math.min(x0, x1), maxX: Math.max(x0, x1), minY: Math.min(y0, y1), maxY: Math.max(y0, y1) }, (c) => c.segs.push(k));
+  };
+  for (const l of lines) for (let i = 0; i < l.length; i += 4) addSeg(l[i], l[i + 1], l[i + 2], l[i + 3]);
+  nails.forEach((n, k) => {
+    addSeg(n.x - arm, n.y, n.x + arm, n.y);
+    addSeg(n.x, n.y - arm, n.x, n.y + arm);
+    at(Math.floor(n.x / cell), Math.floor(n.y / cell)).nails.push(k);
+  });
+
+  const pad = 0.25;
+  const hits = (b: Bounds) => {
+    const q = { minX: b.minX - pad, maxX: b.maxX + pad, minY: b.minY - pad, maxY: b.maxY + pad };
+    let count = 0;
+    const seen = new Set<number>();
+    cells({ minX: q.minX - nailR, maxX: q.maxX + nailR, minY: q.minY - nailR, maxY: q.maxY + nailR }, (c) => {
+      for (const k of c.segs) {
+        if (seen.has(k)) continue;
+        seen.add(k);
+        if (clip(segs[k], segs[k + 1], segs[k + 2], segs[k + 3], q)) count++;
+      }
+      for (const k of c.nails) {
+        const n = nails[k];
+        const dx = Math.max(q.minX - n.x, 0, n.x - q.maxX);
+        const dy = Math.max(q.minY - n.y, 0, n.y - q.maxY);
+        if (Math.hypot(dx, dy) < nailR) count++;
+      }
+      for (const o of c.boxes) if (o.minX < q.maxX && o.maxX > q.minX && o.minY < q.maxY && o.maxY > q.minY) count += 2;
+    });
+    return count;
+  };
+
+  return nails.map((n) => {
+    let best: Label | null = null;
+    let bestHits = Infinity;
+    search: for (const size of [6, 5]) {
+      doc.setFontSize(size);
+      const w = doc.getTextWidth(n.label);
+      const h = size * 0.3528 * 0.72;
+      for (const more of [0, 1.2]) {
+        const d = nailR + 0.35 + more;
+        const e = arm + 0.35 + more;
+        const spots: [number, number][] = [
+          [n.x + d, n.y + d],
+          [n.x - d - w, n.y + d],
+          [n.x + d, n.y - d - h],
+          [n.x - d - w, n.y - d - h],
+          [n.x + e, n.y - h / 2],
+          [n.x - e - w, n.y - h / 2],
+          [n.x - w / 2, n.y + e],
+          [n.x - w / 2, n.y - e - h],
+        ];
+        for (const [x, y] of spots) {
+          const box = { minX: x, maxX: x + w, minY: y, maxY: y + h };
+          const k = hits(box);
+          if (k < bestHits) {
+            bestHits = k;
+            best = { box, size };
+          }
+          if (!k) break search;
+        }
+      }
+    }
+    cells(best!.box, (c) => c.boxes.push(best!.box));
+    return best!;
+  });
+}
+
 export function buildPDF(s: State): Blob {
   const p = s.pattern;
   const content = printBounds(s);
@@ -46,6 +141,8 @@ export function buildPDF(s: State): Blob {
   const overlap = t.aw - t.sx;
   const nailR = s.settings.nailDiameter / 2;
   const unitsIn = s.units === "in";
+  // Drawn this much smaller than life so the printer's enlargement brings it back to true size.
+  const fix = 1 / (ps.scale || 1);
 
   const style = (rgb: RGB, width: number, dash: number[] = []) => {
     doc.setDrawColor(...rgb);
@@ -69,14 +166,28 @@ export function buildPDF(s: State): Blob {
 
   drawCover(doc, s, t, content, stats, pageCount);
 
+  const arm = nailR + 1.2;
+  const labels = ps.labels
+    ? placeLabels(
+        doc,
+        p.nails,
+        s.objects.filter((o) => o.type === "art").map(worldEdges),
+        nailR,
+        arm,
+      )
+    : [];
+
   for (let r = 0; r < t.rows; r++) {
     for (let c = 0; c < t.cols; c++) {
       doc.addPage([t.pw, t.ph], orient);
       const left = t.x0 + c * t.sx;
       const top = t.top - r * t.sy;
       const rect: Bounds = { minX: left, maxX: left + t.aw, minY: top - t.ah, maxY: top };
-      const X = (x: number) => m + (x - left);
-      const Y = (y: number) => m + (top - y);
+      // Page positions, drawn smaller (or larger) about the page centre to make up for the printer.
+      const PX = (v: number) => t.pw / 2 + (v - t.pw / 2) * fix;
+      const PY = (v: number) => t.ph / 2 + (v - t.ph / 2) * fix;
+      const X = (x: number) => PX(m + (x - left));
+      const Y = (y: number) => PY(m + (top - y));
       const seg = (x0: number, y0: number, x1: number, y1: number) => {
         const k = clip(x0, y0, x1, y1, rect);
         if (k) doc.line(X(k[0]), Y(k[1]), X(k[2]), Y(k[3]));
@@ -122,24 +233,36 @@ export function buildPDF(s: State): Blob {
           }
       }
 
+      // Nail numbers, on white so strings don't run through them.
+      labels.forEach(({ box, size }, k) => {
+        const n = p.nails[k];
+        if (n.x - nailR < rect.minX || n.x + nailR > rect.maxX || n.y - nailR < rect.minY || n.y + nailR > rect.maxY) return;
+        // Text is drawn in the fill colour, so set each before use.
+        doc.setFillColor(255, 255, 255);
+        doc.rect(X(box.minX - 0.2), Y(box.maxY + 0.2), (box.maxX - box.minX + 0.4) * fix, (box.maxY - box.minY + 0.4) * fix, "F");
+        doc.setFontSize(size * fix);
+        doc.setTextColor(40);
+        doc.text(n.label, X(box.minX), Y(box.minY));
+      });
+
       // Seams: this page is trimmed on its left/top seams and laid over its neighbours.
       vSeams.forEach((x, i) => {
         if (x < rect.minX || x > rect.maxX) return;
         const cut = i + 1 === c;
         style(cut ? [0, 0, 0] : [150, 150, 150], cut ? 0.25 : 0.15, cut ? [3, 2] : [0.6, 1.2]);
         seg(x, rect.minY, x, rect.maxY);
-        doc.setFontSize(6);
+        doc.setFontSize(6 * fix);
         doc.setTextColor(cut ? 0 : 150);
-        doc.text(cut ? "CUT" : "ALIGN", X(x) - 1, m + 12, { angle: 90 });
+        doc.text(cut ? "CUT" : "ALIGN", X(x) - fix, PY(m + 12), { angle: 90 });
       });
       hSeams.forEach((y, i) => {
         if (y < rect.minY || y > rect.maxY) return;
         const cut = i + 1 === r;
         style(cut ? [0, 0, 0] : [150, 150, 150], cut ? 0.25 : 0.15, cut ? [3, 2] : [0.6, 1.2]);
         seg(rect.minX, y, rect.maxX, y);
-        doc.setFontSize(6);
+        doc.setFontSize(6 * fix);
         doc.setTextColor(cut ? 0 : 150);
-        doc.text(cut ? "CUT" : "ALIGN", m + 4, Y(y) - 1);
+        doc.text(cut ? "CUT" : "ALIGN", PX(m + 4), Y(y) - fix);
       });
       style([0, 0, 0], 0.2);
       for (const [x, y] of marks) {
@@ -147,21 +270,17 @@ export function buildPDF(s: State): Blob {
         seg(x - 3.5, y, x + 3.5, y);
         seg(x, y - 3.5, x, y + 3.5);
         if (x - 2.5 >= rect.minX && x + 2.5 <= rect.maxX && y - 2.5 >= rect.minY && y + 2.5 <= rect.maxY)
-          doc.circle(X(x), Y(y), 2.5, "S");
+          doc.circle(X(x), Y(y), 2.5 * fix, "S");
       }
 
       // Nails: outline at nail size plus a crosshair for centre-punching.
       style([0, 0, 0], 0.2);
-      doc.setFontSize(5);
-      doc.setTextColor(60);
-      const arm = nailR + 1.2;
       for (const n of p.nails) {
         if (n.x < rect.minX - arm || n.x > rect.maxX + arm || n.y < rect.minY - arm || n.y > rect.maxY + arm) continue;
         seg(n.x - arm, n.y, n.x + arm, n.y);
         seg(n.x, n.y - arm, n.x, n.y + arm);
         const inside = n.x - nailR >= rect.minX && n.x + nailR <= rect.maxX && n.y - nailR >= rect.minY && n.y + nailR <= rect.maxY;
-        if (inside) doc.circle(X(n.x), Y(n.y), Math.max(nailR, 0.3), "S");
-        if (ps.labels && inside) doc.text(n.label, X(n.x) + nailR + 0.5, Y(n.y) - nailR - 0.3);
+        if (inside) doc.circle(X(n.x), Y(n.y), Math.max(nailR, 0.3) * fix, "S");
       }
 
       // Page label and a scale check, bottom right (under the next page's overlap when assembled).
@@ -169,16 +288,16 @@ export function buildPDF(s: State): Blob {
       const bx = m + t.aw - 2 - bar;
       const by = m + t.ah - 8;
       style([120, 120, 120], 0.3);
-      doc.line(bx, by, bx + bar, by);
-      doc.line(bx, by - 1, bx, by + 1);
-      doc.line(bx + bar, by - 1, bx + bar, by + 1);
-      doc.setFontSize(6);
+      doc.line(PX(bx), PY(by), PX(bx + bar), PY(by));
+      doc.line(PX(bx), PY(by - 1), PX(bx), PY(by + 1));
+      doc.line(PX(bx + bar), PY(by - 1), PX(bx + bar), PY(by + 1));
+      doc.setFontSize(6 * fix);
       doc.setTextColor(120);
-      doc.text(unitsIn ? "1 in" : "25 mm", bx + bar / 2, by - 1.2, { align: "center" });
-      doc.setFontSize(12);
-      doc.text(tileLabel(r, c), m + t.aw - 2, m + t.ah - 2, { align: "right" });
-      doc.setFontSize(6);
-      doc.text(`page ${r * t.cols + c + 1} of ${pageCount}`, m + t.aw - 12, m + t.ah - 2.4, { align: "right" });
+      doc.text(unitsIn ? "1 in" : "25 mm", PX(bx + bar / 2), PY(by - 1.2), { align: "center" });
+      doc.setFontSize(12 * fix);
+      doc.text(tileLabel(r, c), PX(m + t.aw - 2), PY(m + t.ah - 2), { align: "right" });
+      doc.setFontSize(6 * fix);
+      doc.text(`page ${r * t.cols + c + 1} of ${pageCount}`, PX(m + t.aw - 12), PY(m + t.ah - 2.4), { align: "right" });
     }
   }
 
@@ -215,7 +334,7 @@ function drawCover(
   const H = content.maxY - content.minY;
   const info = [
     `Pattern size: ${formatLengthWithUnit(W, u, 1)} × ${formatLengthWithUnit(H, u, 1)}`,
-    `Nails: ${stats.nails} in ${stats.shapes} shape${stats.shapes === 1 ? "" : "s"}, spaced ${formatLengthWithUnit(s.settings.spacing, u)}`,
+    `Nails: ${stats.nails} in ${stats.shapes} shape${stats.shapes === 1 ? "" : "s"}${stats.strings > stats.shapes ? ` (${stats.strings} strings)` : ""}, spaced ${formatLengthWithUnit(s.settings.spacing, u)}`,
     `Nail diameter: ${formatLengthWithUnit(s.settings.nailDiameter, u)}`,
     `String: ${stats.lines} lines, about ${formatLongLength(stats.estimate, u)}`,
     `Pages: ${pageCount} (${t.rows} row${t.rows === 1 ? "" : "s"} × ${t.cols} column${t.cols === 1 ? "" : "s"}), ${PAPERS[s.print.paper].label}`,
@@ -242,19 +361,30 @@ function drawCover(
     y += 5;
   }
 
-  y += 4;
-  const bar = u === "in" ? 2 * MM_PER_IN : 50;
+  // Scale check: drawn to make up for the printer, so it should print true.
+  y += 3;
+  const fix = 1 / (s.print.scale || 1);
+  doc.setFontSize(8);
+  const note = Math.abs(fix - 1) > 1e-6 ? ` (drawn at ${(fix * 100).toFixed(2)}% for a printer scale of ${(s.print.scale * 100).toFixed(2)}%)` : "";
+  const lines: string[] = doc.splitTextToSize(
+    `This bar should measure exactly ${u === "in" ? "6 in" : "150 mm"}${note}. If it doesn't, enter what it measures on the Print & CNC tab.`,
+    t.pw - 2 * x,
+  );
+  doc.text(lines, x, y);
+  y += 4 * lines.length + 3;
+  const bar = coverBar(u) * fix;
+  const ticks = u === "in" ? 24 : 15;
   doc.setDrawColor(0);
-  doc.setLineWidth(0.4);
+  doc.setLineWidth(0.3);
   doc.setLineDashPattern([], 0);
   doc.line(x, y, x + bar, y);
-  for (let k = 0; k <= (u === "in" ? 8 : 10); k++) {
-    const tx = x + (bar * k) / (u === "in" ? 8 : 10);
+  for (let k = 0; k <= ticks; k++) {
+    const tx = x + (bar * k) / ticks;
     const major = u === "in" ? k % 4 === 0 : k % 5 === 0;
     doc.line(tx, y, tx, y - (major ? 3 : 1.5));
+    if (major) doc.text(String(u === "in" ? k / 4 : k * 10), tx, y + 3.5, { align: "center" });
   }
-  doc.setFontSize(8);
-  doc.text(u === "in" ? "This bar should measure exactly 2 in" : "This bar should measure exactly 50 mm", x + bar + 4, y);
+  y += 3;
 
   // Tile map with a miniature of the pattern.
   const mapTop = y + 10;
@@ -318,7 +448,8 @@ function drawSequence(doc: jsPDF, s: State, t: TilePlan, orient: "l" | "p") {
 
   for (const isl of islands) {
     const lines = isl.sequence.length - 1;
-    newPage(`Stringing order: shape ${isl.label}`);
+    const name = `shape ${isl.label}${isl.part ? ` (string ${isl.part.index} of ${isl.part.of})` : ""}`;
+    newPage(`Stringing order: ${name}`);
     doc.setFont("helvetica", "normal");
     doc.setFontSize(9);
     doc.setTextColor(80);
@@ -337,7 +468,7 @@ function drawSequence(doc: jsPDF, s: State, t: TilePlan, orient: "l" | "p") {
         col++;
         y = pageTop;
         if (col >= cols) {
-          newPage(`Stringing order: shape ${isl.label} (continued)`);
+          newPage(`Stringing order: ${name} (continued)`);
           doc.setFont("courier", "normal");
           doc.setFontSize(8);
           doc.setTextColor(20);

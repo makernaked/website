@@ -36,10 +36,12 @@ export interface State {
   future: Obj[][];
   /** Transient UI message, e.g. import warnings. */
   notice: { text: string; kind: "info" | "error" } | null;
-  /** Clicking the canvas toggles region fills, lines, nails or line widths, instead of selecting. */
-  pickMode: "regions" | "lines" | "nails" | "widths" | null;
+  /** Clicking the canvas toggles region fills or shading, lines, nails or line widths, instead of selecting. */
+  pickMode: "regions" | "shade" | "lines" | "nails" | "widths" | null;
   /** Width given to pieces of line clicked in "widths" mode (mm). */
   paintWidth: number;
+  /** Shading given to regions clicked in "shade" mode. */
+  paintShade: number;
 }
 
 const STORAGE_KEY = "makernaked.string-art.v1";
@@ -52,7 +54,8 @@ export const DEFAULT_SETTINGS: PatternSettings = {
   shading: 4,
   minNails: 12,
   outline: true,
-  edgePass: true,
+  autoSpacing: true,
+  restarts: false,
   seed: 1,
 };
 
@@ -67,6 +70,7 @@ const DEFAULT_PRINT: PrintSettings = {
   labels: true,
   grid: true,
   sequence: true,
+  scale: 1,
 };
 
 const DEFAULT_GCODE: GcodeSettings = {
@@ -107,6 +111,7 @@ function initialState(): State {
     notice: null,
     pickMode: null,
     paintWidth: 0.25 * MM_PER_IN,
+    paintShade: 2,
   };
 }
 
@@ -570,6 +575,28 @@ export function toggleRegion(artId: string, index: number) {
   autoRecalculate();
 }
 
+/**
+ * Gives a region its own shading (saved as a point inside it). Clicking again
+ * with the same shading goes back to the layer's or pattern's shading.
+ */
+export function shadeRegion(artId: string, index: number, shading: number) {
+  const a = findArt(artId);
+  const region = a && arrangement(a).regions[index];
+  if (!a || !region) return;
+  const mine = (a.shades ?? []).filter((x) => regionContains(region, x.at));
+  const others = (a.shades ?? []).filter((x) => !regionContains(region, x.at));
+  const same = mine.length > 0 && mine[mine.length - 1].shading === shading;
+  const shades = same ? others : [...others, { at: region.sample, shading }];
+  updateObject(artId, { shades: shades.length ? shades : undefined } as Partial<Artwork>);
+  autoRecalculate();
+}
+
+export function restoreShades() {
+  const ids = new Set(regionTargets().map((a) => a.id));
+  setObjects(state.objects.map((o) => (o.type === "art" && ids.has(o.id) ? { ...o, shades: undefined } : o)));
+  autoRecalculate();
+}
+
 function findArt(id: string): Artwork | undefined {
   return state.objects.find((o): o is Artwork => o.id === id && o.type === "art");
 }
@@ -686,6 +713,7 @@ export function setArtLayer(id: string, layer: string, patch: LayerSettings) {
   const next = { ...a.layers?.[layer], ...patch };
   if (next.include !== false) delete next.include;
   if (next.lineWidth === undefined) delete next.lineWidth;
+  if (next.shading === undefined) delete next.shading;
   const layers = { ...a.layers, [layer]: next };
   if (!Object.keys(next).length) delete layers[layer];
   updateObject(id, { layers: Object.keys(layers).length ? layers : undefined } as Partial<Artwork>);

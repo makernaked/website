@@ -1,6 +1,7 @@
 import { emptyBounds, extendBounds, worldContours } from "./geometry";
 import type { State } from "./store";
-import type { Bounds, PaperId, PrintSettings } from "./types";
+import type { Bounds, PaperId, PrintSettings, Units } from "./types";
+import { MM_PER_IN } from "./units";
 
 export const PAPERS: Record<PaperId, { label: string; size: [number, number] }> = {
   letter: { label: "Letter", size: [215.9, 279.4] },
@@ -77,3 +78,6 @@ export function planTiles(content: Bounds, ps: PrintSettings): TilePlan {
 
 /** Page names are row-column numbers so they can't be confused with nail labels like "A12". */
 export const tileLabel = (r: number, c: number) => `${r + 1}-${c + 1}`;
+
+/** The scale check bar on the cover: 6 in or 150 mm. */
+export const coverBar = (units: Units) => (units === "in" ? 6 * MM_PER_IN : 150);

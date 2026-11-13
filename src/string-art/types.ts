@@ -29,6 +29,8 @@ export interface LayerSettings {
   include?: boolean;
   /** Width for this layer's single lines (local units), instead of the artwork's. */
   lineWidth?: number;
+  /** How dark this layer's shapes are filled, instead of the pattern's shading. */
+  shading?: number;
 }
 
 interface ObjBase {
@@ -68,6 +70,8 @@ export interface Artwork extends ObjBase {
   layers?: Record<string, LayerSettings>;
   /** Region fill choices, each saved as a point inside the region (artwork units). */
   fills?: { at: Pt; on: boolean }[];
+  /** Region shading, each saved as a point inside the region (artwork units). */
+  shades?: { at: Pt; shading: number }[];
   /** Removed line pieces (no nails; regions either side join), each saved as a point on the piece. */
   cuts?: Pt[];
   /** Widths painted onto pieces of single lines, each saved as a point on the piece (artwork units). */
@@ -88,8 +92,10 @@ export interface PatternSettings {
   minNails: number;
   /** Start each shape with string around its edge, nail to neighbouring nail. */
   outline: boolean;
-  /** Then a pass around its edge, from every nail to the one two along. */
-  edgePass: boolean;
+  /** Put nails closer together where the shading can't otherwise be reached. */
+  autoSpacing: boolean;
+  /** Allow a shape more than one string: tie off and start again instead of long trips across it. */
+  restarts: boolean;
   seed: number;
 }
 
@@ -103,7 +109,10 @@ export interface Nail {
 }
 
 export interface Island {
+  /** The shape's label; a shape with more than one string has an island per string. */
   label: string;
+  /** Which of the shape's strings this is (1-based) and how many it has, if more than one. */
+  part?: { index: number; of: number };
   /** Indices into Pattern.nails. */
   nails: number[];
   /** Stringing order as indices into Pattern.nails. */
@@ -141,6 +150,8 @@ export interface PrintSettings {
   labels: boolean;
   grid: boolean;
   sequence: boolean;
+  /** How much the printer enlarges what it prints (1.0156 = 1.56% bigger); pages are drawn smaller to make up for it. */
+  scale: number;
 }
 
 export interface GcodeSettings {

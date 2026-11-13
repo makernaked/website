@@ -156,18 +156,22 @@ export function NumberInput({
   max,
   step = 1,
   digits = 2,
+  placeholder,
 }: {
-  value: number;
+  /** null shows the placeholder (e.g. "use the default"). */
+  value: number | null;
   onCommit: (v: number) => void;
   min?: number;
   max?: number;
   step?: number;
   digits?: number;
+  placeholder?: string;
 }) {
   const clamp = (v: number) => Math.min(max ?? Infinity, Math.max(min ?? -Infinity, v));
   return (
     <DraftInput
-      shown={String(Math.round(value * 10 ** digits) / 10 ** digits)}
+      shown={value === null ? "" : String(Math.round(value * 10 ** digits) / 10 ** digits)}
+      placeholder={placeholder}
       parse={(s) => {
         const v = parseFloat(s);
         return Number.isFinite(v) ? v : null;

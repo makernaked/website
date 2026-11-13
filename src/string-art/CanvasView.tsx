@@ -39,6 +39,7 @@ import {
   setState,
   subscribe,
   paintLineWidth,
+  shadeRegion,
   toggleLine,
   toggleNail,
   toggleRegion,
@@ -95,7 +96,7 @@ export default function CanvasView() {
       if (!w || !h) return;
       const s = getState();
       overlay.current.patternStale = !!s.pattern && s.pattern.key !== patternKey(s.objects, s.settings);
-      if (s.pickMode !== "regions") overlay.current.hoverRegion = null;
+      if (s.pickMode !== "regions" && s.pickMode !== "shade") overlay.current.hoverRegion = null;
       if (s.pickMode !== "lines") overlay.current.hoverLine = null;
       if (s.pickMode !== "widths") overlay.current.hoverPiece = null;
       if (s.pickMode !== "nails") overlay.current.hoverNail = null;
@@ -276,7 +277,8 @@ export default function CanvasView() {
     const setCursor = (sx: number, sy: number) => {
       if (drag.current) return;
       if (space.current) canvas.style.cursor = "grab";
-      else if (getState().pickMode === "regions") canvas.style.cursor = overlay.current.hoverRegion ? "pointer" : "default";
+      else if (getState().pickMode === "regions" || getState().pickMode === "shade")
+        canvas.style.cursor = overlay.current.hoverRegion ? "pointer" : "default";
       else if (getState().pickMode === "lines") canvas.style.cursor = overlay.current.hoverLine ? "pointer" : "default";
       else if (getState().pickMode === "nails") canvas.style.cursor = overlay.current.hoverNail ? "pointer" : "default";
       else if (getState().pickMode === "widths") canvas.style.cursor = overlay.current.hoverPiece ? "pointer" : "default";
@@ -300,6 +302,11 @@ export default function CanvasView() {
       if (mode === "regions") {
         const hit = regionHit(sx, sy);
         if (hit) toggleRegion(hit.id, hit.index);
+        return;
+      }
+      if (mode === "shade") {
+        const hit = regionHit(sx, sy);
+        if (hit) shadeRegion(hit.id, hit.index, getState().paintShade);
         return;
       }
       if (mode === "lines") {
@@ -363,7 +370,7 @@ export default function CanvasView() {
       const d = drag.current;
       if (!d) {
         const mode = getState().pickMode;
-        if (mode === "regions") overlay.current.hoverRegion = regionHit(sx, sy);
+        if (mode === "regions" || mode === "shade") overlay.current.hoverRegion = regionHit(sx, sy);
         if (mode === "lines") overlay.current.hoverLine = lineHit(sx, sy);
         if (mode === "nails") overlay.current.hoverNail = nailHit(sx, sy);
         if (mode === "widths") overlay.current.hoverPiece = pieceHit(sx, sy, e.shiftKey);
@@ -591,6 +598,8 @@ export default function CanvasView() {
         <div className="absolute top-8 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-full border border-amber-500/50 bg-neutral-950/90 py-1 pr-1 pl-4 text-sm text-amber-100 shadow-lg">
           {pickMode === "regions"
             ? "Click regions to fill or clear them"
+            : pickMode === "shade"
+              ? "Click a region to give it the shading (again to undo)"
             : pickMode === "lines"
               ? "Click a line to remove it (no nails, regions join) or put it back"
               : pickMode === "widths"

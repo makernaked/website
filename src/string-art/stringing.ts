@@ -2,25 +2,35 @@ import { distToSegment, rng, segmentsTouch } from "./geometry";
 import type { Pt } from "./types";
 
 export interface FillOptions {
-  /** Total length of string to lay inside the shape. */
-  targetLength: number;
+  /** How dark it should be at a point: millimetres of string per square millimetre. */
+  densityAt: (x: number, y: number) => number;
   seed: number;
   /** First take the string around each edge, nail to neighbouring nail. */
   outline?: boolean;
-  /** Then around each edge from every nail to the one two along. */
-  edges?: boolean;
+  /** Tie off and start a new string rather than make long trips across the shape. */
+  restarts?: boolean;
+}
+
+export interface FillResult {
+  /** Stringing order, one list per string (just one unless restarts are allowed), as indices into the rings concatenated in order. */
+  strings: number[][];
+  /** Centres of patches left well short of their target: where closer nails would help. */
+  thin: Pt[];
+  /** Outlines (convex) around sizeable areas left well short of their target. */
+  light: Pt[][];
 }
 
 /**
- * Filled-silhouette stringing. The string goes nail to nail across the inside
- * of the shape; each next nail is picked greedily to cover the least-covered
- * part of the shape, so the fill comes out even. Lines never leave the shape
- * or cross a hole.
+ * Filled-silhouette stringing to an even darkness. The shape is divided into
+ * small patches, each with a target amount of string. The string goes nail to
+ * nail across the inside; each next line is the one that does the most for
+ * patches still short of their target, so long lines through patches that are
+ * already dark aren't favoured and every part of the shape ends up equally
+ * dark. Lines never leave the shape or cross a hole.
  *
- * `rings[0]` is the outer boundary and any further rings are holes. Returns
- * the stringing order as indices into the rings concatenated in order.
+ * `rings[0]` is the outer boundary and any further rings are holes.
  */
-export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
+export function fillIsland(rings: Pt[][], opts: FillOptions): FillResult {
   const nodes: Pt[] = [];
   const ringOf: number[] = [];
   const posInRing: number[] = [];
@@ -34,12 +44,7 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
     });
   });
   const n = nodes.length;
-  if (n < 4) return [];
-
-  const ringNext = (i: number) => {
-    const r = ringOf[i];
-    return ringStart[r] + ((posInRing[i] + 1) % rings[r].length);
-  };
+  if (n < 4) return { strings: [], thin: [], light: [] };
 
   // Boundary edges as node index pairs.
   const ea: number[] = [];
@@ -194,12 +199,20 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
     return r;
   };
 
-  // Coverage raster limited to the inside of the shape.
-  const g = Math.max(W, H) / 160;
+  // Patches limited to the inside of the shape, each with a target number of
+  // string passes (a string crossing a patch lays about one patch-width of string).
+  // Patches are small enough to judge narrow parts, but no smaller than a target
+  // of about three passes: much smaller and a single string overshoots them, so
+  // the fill can't judge evenness.
+  const densities: number[] = [];
+  for (let i = 0; i < 5; i++) for (let j = 0; j < 5; j++) densities.push(opts.densityAt(minX + ((i + 0.5) * W) / 5, minY + ((j + 0.5) * H) / 5));
+  const density = Math.max(...densities, 1e-6);
+  const g = Math.max(Math.max(W, H) / 240, 3 / density);
   const rw = Math.ceil(W / g) + 1;
   const rh = Math.ceil(H / g) + 1;
   const mask = new Uint8Array(rw * rh);
   const cov = new Float32Array(rw * rh);
+  const target = new Float32Array(rw * rh);
   const xs: number[] = [];
   for (let j = 0; j < rh; j++) {
     const py = minY + (j + 0.5) * g;
@@ -213,11 +226,38 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
     for (let k = 0; k + 1 < xs.length; k += 2) {
       const i0 = Math.max(0, Math.ceil((xs[k] - minX) / g - 0.5));
       const i1 = Math.min(rw - 1, Math.floor((xs[k + 1] - minX) / g - 0.5));
-      for (let i = i0; i <= i1; i++) mask[j * rw + i] = 1;
+      for (let i = i0; i <= i1; i++) {
+        mask[j * rw + i] = 1;
+        target[j * rw + i] = opts.densityAt(minX + (i + 0.5) * g, py) * g;
+      }
     }
   }
+  // Patches the edge runs through: next to the edge between two nails only the
+  // outline reaches, so they aren't hunted down or reported when light.
+  const edge = new Uint8Array(rw * rh);
+  for (let c = 0; c < mask.length; c++)
+    if (mask[c]) edge[c] = nearBoundary([minX + ((c % rw) + 0.5) * g, minY + (Math.floor(c / rw) + 0.5) * g], g / 2) ? 1 : 0;
+  // Darkness is judged over about 12 mm: single patches hold only a few strings,
+  // so on their own they're light or dark by chance.
+  const reach = Math.max(1, Math.round(6 / g));
+  /** How close a patch's neighbourhood (away from the edge) is to its target, 0–1. */
+  const darkness = (c: number) => {
+    const i = c % rw;
+    const j = (c - i) / rw;
+    let sum = 0;
+    let count = 0;
+    for (let jj = Math.max(0, j - reach); jj <= Math.min(rh - 1, j + reach); jj++)
+      for (let ii = Math.max(0, i - reach); ii <= Math.min(rw - 1, i + reach); ii++) {
+        const k = jj * rw + ii;
+        if (!mask[k] || edge[k]) continue;
+        sum += Math.min(1, cov[k] / target[k]);
+        count++;
+      }
+    return count ? sum / count : 1;
+  };
 
-  const lineCells = (a: number, b: number, visit: (cell: number) => void) => {
+  /** Visits the patches a line crosses, with how far each is from the line's nearer end. */
+  const lineCells = (a: number, b: number, visit: (cell: number, fromEnd: number) => void) => {
     const A = nodes[a];
     const B = nodes[b];
     const len = Math.hypot(B[0] - A[0], B[1] - A[1]);
@@ -229,47 +269,52 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
       const j = Math.floor((A[1] + (B[1] - A[1]) * t - minY) / g);
       if (i < 0 || j < 0 || i >= rw || j >= rh) continue;
       const c = j * rw + i;
-      if (c !== last && mask[c]) visit(c);
+      if (c !== last && mask[c]) visit(c, Math.min(t, 1 - t) * len);
       last = c;
     }
   };
 
-  const score = (a: number, b: number) => {
-    let s = 0;
-    lineCells(a, b, (c) => {
-      const w = 1 / (1 + cov[c]);
-      s += w * w;
+  /**
+   * What a line is worth: how much closer it brings the patches it crosses to
+   * their targets (by squared shortfall, relative to each target). Emptier
+   * patches pull harder, and patches already dark push back harder the darker
+   * they get, so long lines through dark patches lose out to short ones into
+   * light patches.
+   */
+  const gain = (c: number) => (2 * (target[c] - cov[c]) - 1) / target[c];
+  // Every line at a nail crowds in right beside it: that's no reason to avoid
+  // one more there, so patches that close only count when they're short.
+  const crowded = g;
+  const worth = (a: number, b: number) => {
+    let net = 0;
+    lineCells(a, b, (c, fromEnd) => {
+      const v = gain(c);
+      if (v > 0 || fromEnd > crowded) net += v;
     });
-    return s;
+    return net;
   };
 
   const random = rng(opts.seed);
-  // Rough line count for the target, to cap how often any one nail is wrapped.
-  let cells = 0;
-  for (let c = 0; c < mask.length; c++) cells += mask[c];
-  const estLines = opts.targetLength / Math.max(Math.sqrt(cells) * g * 0.7, 1e-9);
-  const maxUse = Math.max(6, Math.ceil((4 * estLines) / n));
-  const maxLines = n * 40;
+  const maxUse = 40;
+  const maxLines = n * 60;
   const use = new Uint16Array(n);
   const used = new Set<number>();
   const all = Array.from({ length: n }, (_, i) => i);
-  const sampleSize = 300;
+  // Every nail is tried as the next one up to this many; beyond it, the nearest plus a random spread.
+  const sampleSize = 800;
 
-  // Nearest nails to each nail, found by searching outward through a grid.
+  // Nearest nails to a point, found by searching outward through a grid.
   const nodeGrid: number[][] = Array.from({ length: gx * gy }, () => []);
   nodes.forEach(([x, y], i) => nodeGrid[cy(y) * gx + cx(x)].push(i));
-  const nearCache = new Map<number, number[]>();
-  const nearby = (a: number) => {
-    const cached = nearCache.get(a);
-    if (cached) return cached;
+  const around = (x: number, y: number, count: number) => {
     const out: number[] = [];
-    const x0 = cx(nodes[a][0]);
-    const y0 = cy(nodes[a][1]);
+    const x0 = cx(x);
+    const y0 = cy(y);
     const take = (i: number, j: number) => {
       if (i < 0 || j < 0 || i >= gx || j >= gy) return;
-      for (const k of nodeGrid[j * gx + i]) if (k !== a) out.push(k);
+      for (const k of nodeGrid[j * gx + i]) out.push(k);
     };
-    for (let r = 0; out.length < sampleSize / 2 && r <= Math.max(gx, gy); r++) {
+    for (let r = 0; out.length < count && r <= Math.max(gx, gy); r++) {
       if (r === 0) take(x0, y0);
       for (let i = x0 - r; r > 0 && i <= x0 + r; i++) {
         take(i, y0 - r);
@@ -280,124 +325,280 @@ export function fillIsland(rings: Pt[][], opts: FillOptions): number[] {
         take(x0 + r, j);
       }
     }
-    nearCache.set(a, out);
     return out;
   };
+  const nearCache = new Map<number, number[]>();
+  const nearby = (a: number) => {
+    let out = nearCache.get(a);
+    if (!out) {
+      out = around(nodes[a][0], nodes[a][1], sampleSize / 2 + 1).filter((k) => k !== a);
+      nearCache.set(a, out);
+    }
+    return out;
+  };
+  /** The nearest nails plus a random spread for long lines. */
+  const candidates = (from: number, count = sampleSize) => {
+    if (n <= count) return all;
+    const out = nearby(from).slice(0, count / 2);
+    for (let k = 0; k < count / 2; k++) out.push(Math.floor(random() * n));
+    return out;
+  };
+  const open = (a: number, b: number) =>
+    a !== b && use[b] < maxUse && !used.has(Math.min(a, b) * n + Math.max(a, b)) && visible(a, b);
 
   let cur = 0;
-  const seq = [cur];
-  let hops = 0;
-  let lines = 0;
-  let laid = 0;
+  let seq = [cur];
+  const strings = [seq];
   const lay = (b: number) => {
-    lineCells(cur, b, (c) => {
-      cov[c] += 1;
-    });
+    lineCells(cur, b, (c) => (cov[c] += 1));
     used.add(Math.min(b, cur) * n + Math.max(b, cur));
-    laid += Math.hypot(nodes[b][0] - nodes[cur][0], nodes[b][1] - nodes[cur][1]);
     use[cur]++;
     use[b]++;
-    lines++;
-    seq.push(b);
-    cur = b;
-  };
-  /** Along the boundary to the next nail (follows the drawn edge). */
-  const step = (b: number) => {
     seq.push(b);
     cur = b;
   };
 
-  // Edge passes, before the fill: an outline lap (nail to neighbouring nail), then
-  // every nail to the one two along. They define the edge and fill the corners
-  // and curves between neighbouring nails that long lines miss.
-  if (opts.outline || opts.edges) {
+
+  // Optional outline first: around each ring, nail to neighbouring nail.
+  if (opts.outline) {
     rings.forEach((ring, r) => {
       const len = ring.length;
       if (len < 3) return;
       const at = (k: number) => ringStart[r] + (((k % len) + len) % len);
-      let k0: number;
-      if (ringOf[cur] === r) k0 = posInRing[cur];
-      else {
+      let k0 = posInRing[cur];
+      if (ringOf[cur] !== r) {
         // Get onto this ring (a hole) with a line from where the string is.
         const onto = ring.findIndex((_, k) => visible(cur, at(k)));
         if (onto < 0) return;
         lay(at(onto));
         k0 = onto;
       }
-      if (opts.outline) for (let k = 1; k <= len; k++) lay(at(k0 + k));
-      if (!opts.edges || len < 5) return;
-      // With an odd number of nails one lap covers every pair; with an even number, two.
-      for (let lap = 0; lap < (len % 2 ? 1 : 2); lap++) {
-        if (lap === 1) step(at(++k0));
-        for (let s = 0; s < (len % 2 ? len : len / 2); s++) {
-          const b = at(k0 + 2 * s + 2);
-          if (visible(cur, b)) lay(b);
-          else {
-            // Inside a concave corner the shortcut would leave the shape: follow the edge.
-            step(at(k0 + 2 * s + 1));
-            step(b);
-          }
-        }
-      }
+      for (let k = 1; k <= len; k++) lay(at(k0 + k));
     });
   }
 
-  // Where the shape is narrow (a nail on another part of the edge within 1.5
-  // nail spacings), strings go straight across: the fill takes that line whenever
-  // it reaches the nail. Long lines alone leave thin bands with only diagonals.
-  const across = new Int32Array(n).fill(-1);
-  for (let i = 0; i < n; i++) {
-    let bestD = avgEdge * 1.5;
-    for (const j of nearby(i)) {
-      if (ringOf[j] === ringOf[i]) {
-        const len = rings[ringOf[i]].length;
-        const d = Math.abs(posInRing[i] - posInRing[j]);
-        if (Math.min(d, len - d) < 3) continue;
-      }
-      const d = Math.hypot(nodes[j][0] - nodes[i][0], nodes[j][1] - nodes[i][1]);
-      if (d < bestD && visible(i, j)) {
-        bestD = d;
-        across[i] = j;
-      }
+  /**
+   * The fewest lines from the current nail to `to`: a line inside the shape to
+   * one of the nearest nails, used before or not, or a step to the next nail
+   * along the edge. Null if there's no way there.
+   */
+  const alongEdge = (a: number, b: number) => {
+    if (ringOf[a] !== ringOf[b]) return false;
+    const d = Math.abs(posInRing[a] - posInRing[b]);
+    return Math.min(d, rings[ringOf[a]].length - d) === 1;
+  };
+  const route = (to: number): number[] | null => {
+    const prev = new Int32Array(n).fill(-1);
+    prev[cur] = cur;
+    let frontier = [cur];
+    const steps = (a: number) => {
+      const r = ringOf[a];
+      const len = rings[r].length;
+      const k = posInRing[a];
+      return [ringStart[r] + ((k + 1) % len), ringStart[r] + ((k + len - 1) % len), ...nearby(a).slice(0, 60)];
+    };
+    while (frontier.length) {
+      const next: number[] = [];
+      for (const a of frontier)
+        for (const b of steps(a)) {
+          if (prev[b] >= 0 || use[b] >= maxUse || (!alongEdge(a, b) && !visible(a, b))) continue;
+          prev[b] = a;
+          if (b === to) {
+            const path = [b];
+            for (let v = a; v !== cur; v = prev[v]) path.push(v);
+            return path.reverse();
+          }
+          next.push(b);
+        }
+      frontier = next;
     }
-  }
+    return null;
+  };
 
-  for (let guard = 0; laid < opts.targetLength && lines < maxLines && guard < maxLines * 4; guard++) {
-    const p = across[cur];
-    if (p >= 0 && !used.has(Math.min(p, cur) * n + Math.max(p, cur))) {
-      hops = 0;
-      lay(p);
-      continue;
+  // Patches the string has been sent to, and ones no line can help any more.
+  const NEEDY = 0.3;
+  const visits = new Uint8Array(rw * rh);
+  const gaveUp = new Uint8Array(rw * rh);
+  // Patches given up on; with too few nails for the shading there can be
+  // thousands no line helps, and they're left as they are.
+  let failsLeft = 300;
+  /**
+   * Nothing worth doing near the string: send it to the patch furthest short of
+   * its target (under 70% of it) that a line can still help, and lay that line.
+   * False when there's none left.
+   */
+  const angle = new Float64Array(n);
+  const sortedAngle = new Float64Array(n);
+  const byAngle = Array.from({ length: n }, (_, k) => k);
+  const goToNeedy = () => {
+    const short = (c: number) => (target[c] - cov[c]) / target[c];
+    const needy: number[] = [];
+    for (let c = 0; c < mask.length; c++) if (mask[c] && !edge[c] && !gaveUp[c] && short(c) > NEEDY && darkness(c) < 1 - NEEDY) needy.push(c);
+    needy.sort((a, b) => short(b) - short(a));
+    for (const c0 of needy) {
+      // Sent here a few times already and it's still short: leave it.
+      if (++visits[c0] > 3) {
+        gaveUp[c0] = 1;
+        continue;
+      }
+      // The best line through it, from any nail: nails sorted by their angle
+      // around the patch, so each nail's partners lie roughly opposite.
+      const P: Pt = [minX + ((c0 % rw) + 0.5) * g, minY + (Math.floor(c0 / rw) + 0.5) * g];
+      for (let k = 0; k < n; k++) angle[k] = Math.atan2(nodes[k][1] - P[1], nodes[k][0] - P[0]);
+      byAngle.sort((a, b) => angle[a] - angle[b]);
+      for (let k = 0; k < n; k++) sortedAngle[k] = angle[byAngle[k]];
+      let from = -1;
+      let to = -1;
+      let bestWorth = 0;
+      for (let m = 0; m < n; m++) {
+        const dm = Math.hypot(nodes[m][0] - P[0], nodes[m][1] - P[1]);
+        // Partners within this angle of straight through pass close enough to the patch.
+        const spread = Math.min(0.6, (g * 0.75) / Math.max(dm, g) + 0.02);
+        let want = angle[m] + Math.PI;
+        if (want > Math.PI) want -= 2 * Math.PI;
+        for (const lo of [want - spread, want - spread + 2 * Math.PI, want - spread - 2 * Math.PI]) {
+          let k = lowerBound(sortedAngle, lo);
+          for (; k < n && sortedAngle[k] <= lo + 2 * spread; k++) {
+            const c = byAngle[k];
+            if (c <= m || distToSegment(P, nodes[m], nodes[c]) > g * 0.75) continue;
+            if (use[m] >= maxUse || use[c] >= maxUse || used.has(m * n + c) || !visible(m, c)) continue;
+            let through = false;
+            lineCells(m, c, (q) => (through ||= q === c0));
+            if (!through) continue;
+            const w = worth(m, c);
+            if (w > bestWorth) {
+              bestWorth = w;
+              // Start from whichever end is nearer the string.
+              const nearM = Math.hypot(nodes[m][0] - nodes[cur][0], nodes[m][1] - nodes[cur][1]);
+              const nearC = Math.hypot(nodes[c][0] - nodes[cur][0], nodes[c][1] - nodes[cur][1]);
+              [from, to] = nearM <= nearC ? [m, c] : [c, m];
+            }
+          }
+        }
+      }
+      const path = from < 0 ? null : from === cur ? [] : route(from);
+      if (!path) {
+        gaveUp[c0] = 1;
+        if (--failsLeft < 0) return false;
+        continue;
+      }
+      if (opts.restarts && path.length > 2) {
+        // A long way round: tie off, and start a new string there.
+        seq = [from];
+        strings.push(seq);
+        cur = from;
+      } else for (const b of path) lay(b);
+      lay(to);
+      return true;
     }
-    let cands = all;
-    if (n > sampleSize) {
-      // The nearest nails plus a random spread for long lines. In thin shapes
-      // (such as lines given a width) the near ones are often all that's in view.
-      cands = [...nearby(cur)];
-      for (let k = 0; k < sampleSize / 2; k++) cands.push(Math.floor(random() * n));
-    }
+    return false;
+  };
+
+  // Fill until no line anywhere does more good than harm.
+  for (let lines = 0; lines < maxLines; lines++) {
     let best = -1;
-    let bestScore = 0;
-    for (const c of cands) {
-      if (c === cur || use[c] >= maxUse) continue;
-      const key = Math.min(c, cur) * n + Math.max(c, cur);
-      if (used.has(key) || !visible(cur, c)) continue;
-      const sc = score(cur, c) * (0.7 + 0.6 * random());
-      if (sc > bestScore) {
-        bestScore = sc;
+    let bestWorth = 0;
+    for (const c of candidates(cur)) {
+      if (!open(cur, c)) continue;
+      const w = worth(cur, c) * (0.85 + 0.3 * random());
+      if (w > bestWorth) {
+        bestWorth = w;
         best = c;
       }
     }
-    if (best < 0 || bestScore < 0.05) {
-      // Nowhere useful to go from here: step along the boundary to the next nail.
-      cur = ringNext(cur);
-      seq.push(cur);
-      if (++hops > n) break;
+    if (best >= 0) {
+      lay(best);
       continue;
     }
-    hops = 0;
-    lay(best);
+    // Nothing worth it from here: cross to the nail with the best line onward
+    // (the crossing itself may add a little extra darkness).
+    let via = -1;
+    let viaWorth = 0;
+    for (const m of candidates(cur, 60)) {
+      if (!open(cur, m)) continue;
+      const there = worth(cur, m);
+      for (const c of candidates(m, 60)) {
+        if (!open(m, c)) continue;
+        const w = there + worth(m, c);
+        if (w > viaWorth) {
+          viaWorth = w;
+          via = m;
+        }
+      }
+    }
+    if (via >= 0) {
+      lay(via);
+      continue;
+    }
+    if (!goToNeedy()) break;
   }
-  if (hops) seq.length -= hops;
-  return seq.length > 1 ? seq : [];
+
+  // Thin: patches whose neighbourhood is well short of its target.
+  const isThin = new Uint8Array(rw * rh);
+  const thin: Pt[] = [];
+  for (let c = 0; c < mask.length; c++) {
+    if (!mask[c] || edge[c] || darkness(c) >= 0.7) continue;
+    isThin[c] = 1;
+    thin.push([minX + ((c % rw) + 0.5) * g, minY + (Math.floor(c / rw) + 0.5) * g]);
+  }
+
+  // Light areas: thin patches that touch, covering at least a nail gap squared.
+  const light: Pt[][] = [];
+  const seen = new Uint8Array(rw * rh);
+  for (let c0 = 0; c0 < isThin.length; c0++) {
+    if (!isThin[c0] || seen[c0]) continue;
+    seen[c0] = 1;
+    const area = [c0];
+    for (let q = 0; q < area.length; q++) {
+      const i = area[q] % rw;
+      const j = (area[q] - i) / rw;
+      for (let jj = Math.max(0, j - 1); jj <= Math.min(rh - 1, j + 1); jj++)
+        for (let ii = Math.max(0, i - 1); ii <= Math.min(rw - 1, i + 1); ii++) {
+          const c = jj * rw + ii;
+          if (isThin[c] && !seen[c]) {
+            seen[c] = 1;
+            area.push(c);
+          }
+        }
+    }
+    if (area.length * g * g < avgEdge * avgEdge) continue;
+    const corners: Pt[] = [];
+    for (const c of area) {
+      const x = minX + (c % rw) * g;
+      const y = minY + Math.floor(c / rw) * g;
+      corners.push([x, y], [x + g, y], [x + g, y + g], [x, y + g]);
+    }
+    light.push(convexHull(corners));
+  }
+  return { strings: strings.filter((x) => x.length > 1), thin, light };
+}
+
+/** Convex hull, anticlockwise (monotone chain). */
+function convexHull(pts: Pt[]): Pt[] {
+  const sorted = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o: Pt, a: Pt, b: Pt) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower: Pt[] = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper: Pt[] = [];
+  for (let k = sorted.length - 1; k >= 0; k--) {
+    const p = sorted[k];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  return [...lower.slice(0, -1), ...upper.slice(0, -1)];
+}
+
+/** First index in sorted `a` whose value is at least `x`. */
+function lowerBound(a: Float64Array, x: number): number {
+  let lo = 0;
+  let hi = a.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (a[mid] < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }

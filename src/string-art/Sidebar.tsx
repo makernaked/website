@@ -19,6 +19,7 @@ import {
   select,
   restoreLines,
   restoreNails,
+  restoreShades,
   restoreWidths,
   setAllRegions,
   setArtGap,
@@ -30,7 +31,7 @@ import {
   updateObject,
   useEditor,
 } from "./store";
-import { PAPERS, planTiles, printBounds } from "./tiles";
+import { coverBar, PAPERS, planTiles, printBounds } from "./tiles";
 import type { Artwork, Bounds, GcodeSettings, Obj, PaperId, PatternSettings, PrintSettings, Pt, RefShape, Units } from "./types";
 import { AlignIcon, Btn, Check, Field, LengthInput, NumberInput, Row, Section, Segmented, Select } from "./ui";
 import { formatLength, formatLongLength, MM_PER_IN, unitLabel } from "./units";
@@ -381,50 +382,70 @@ function LayerList({ o, units }: { o: Artwork; units: Units }) {
       {[...stats].map(([name, s]) => {
         const settings = o.layers?.[name];
         const included = layerIncluded(o, name || undefined);
+        const reset = (title: string, patch: Parameters<typeof setArtLayer>[2]) => (
+          <button
+            type="button"
+            className="px-0.5 text-neutral-500 hover:text-neutral-200"
+            title={title}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => setArtLayer(o.id, name, patch)}
+          >
+            ↺
+          </button>
+        );
         return (
-          <div key={name} className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              className="accent-amber-500"
-              title={included ? "Leave this layer out" : "Use this layer"}
-              disabled={!name}
-              checked={included}
-              onChange={(e) => setArtLayer(o.id, name, { include: e.target.checked })}
-            />
-            <span className={`min-w-0 flex-1 truncate text-sm ${included ? "text-neutral-200" : "text-neutral-500 line-through"}`}>
-              {name || "(no layer)"}
-              <span className="ml-1.5 text-[11px] text-neutral-500 no-underline">
-                {[s.open && plural(s.open, "line"), s.shapes && plural(s.shapes, "shape")].filter(Boolean).join(", ")}
+          <div key={name} className="space-y-1">
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                className="accent-amber-500"
+                title={included ? "Leave this layer out" : "Use this layer"}
+                disabled={!name}
+                checked={included}
+                onChange={(e) => setArtLayer(o.id, name, { include: e.target.checked })}
+              />
+              <span className={`min-w-0 flex-1 truncate text-sm ${included ? "text-neutral-200" : "text-neutral-500 line-through"}`}>
+                {name || "(no layer)"}
+                <span className="ml-1.5 text-[11px] text-neutral-500 no-underline">
+                  {[s.open && plural(s.open, "line"), s.shapes && plural(s.shapes, "shape")].filter(Boolean).join(", ")}
+                </span>
               </span>
-            </span>
-            {!!name && s.open > 0 && included && (
-              <div className="flex w-24 shrink-0 items-center gap-0.5" title="Line width for this layer (blank uses the artwork's)">
-                <LengthInput
-                  value={settings?.lineWidth !== undefined ? settings.lineWidth * k : null}
-                  placeholder="width"
-                  units={units}
-                  min={0}
-                  onCommit={(v) => setArtLayer(o.id, name, { lineWidth: v / k })}
-                />
-                {settings?.lineWidth !== undefined && (
-                  <button
-                    type="button"
-                    className="px-0.5 text-neutral-500 hover:text-neutral-200"
-                    title="Use the artwork's line width"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => setArtLayer(o.id, name, { lineWidth: undefined })}
-                  >
-                    ↺
-                  </button>
+            </div>
+            {!!name && included && (
+              <div className="ml-6 grid grid-cols-2 gap-1">
+                {s.open > 0 ? (
+                  <div className="flex items-center gap-0.5" title="Line width for this layer's single lines (blank uses the artwork's)">
+                    <LengthInput
+                      value={settings?.lineWidth !== undefined ? settings.lineWidth * k : null}
+                      placeholder="width"
+                      units={units}
+                      min={0}
+                      onCommit={(v) => setArtLayer(o.id, name, { lineWidth: v / k })}
+                    />
+                    {settings?.lineWidth !== undefined && reset("Use the artwork's line width", { lineWidth: undefined })}
+                  </div>
+                ) : (
+                  <span />
                 )}
+                <div className="flex items-center gap-0.5" title="How dark this layer is filled (blank uses the pattern's shading)">
+                  <NumberInput
+                    value={settings?.shading ?? null}
+                    placeholder="shade"
+                    min={0.25}
+                    max={20}
+                    step={0.5}
+                    onCommit={(v) => setArtLayer(o.id, name, { shading: v })}
+                  />
+                  {settings?.shading !== undefined && reset("Use the pattern's shading", { shading: undefined })}
+                </div>
               </div>
             )}
           </div>
         );
       })}
       <p className="text-[11px] text-neutral-500">
-        Untick a layer to leave it out (no nails or regions; it stays as a faint guide). A layer&apos;s width overrides the artwork&apos;s line
-        width for its single lines.
+        Untick a layer to leave it out (no nails or regions; it stays as a faint guide). Width sets the layer&apos;s single lines; shade sets
+        how dark its parts are filled. Blank uses the artwork&apos;s width and the pattern&apos;s shading.
       </p>
     </div>
   );
@@ -483,10 +504,12 @@ function NailsPanel() {
     const removed = count((a) => a.cuts?.length ?? 0);
     const removedNails = count((a) => a.removedNails?.length ?? 0);
     const painted = count((a) => a.widths?.length ?? 0);
-    return { total, filled, removed, removedNails, painted };
+    const shaded = count((a) => a.shades?.length ?? 0);
+    return { total, filled, removed, removedNails, painted, shaded };
   }, [objects]);
   const artSelected = objects.some((o) => o.type === "art" && selection.includes(o.id));
   const paintWidth = useEditor((s) => s.paintWidth);
+  const paintShade = useEditor((s) => s.paintShade);
   const toggleMode = (mode: NonNullable<typeof pickMode>) => setState({ pickMode: pickMode === mode ? null : mode });
   const set = (patch: Partial<PatternSettings>) => setState((s) => ({ settings: { ...s.settings, ...patch } }));
   const show = (patch: Partial<typeof display>) => setState((s) => ({ display: { ...s.display, ...patch } }));
@@ -534,6 +557,11 @@ function NailsPanel() {
         <p className="text-[11px] text-neutral-500">
           Small filled shapes get closer nails, down to 3× the nail diameter, so they can take as much shading as big ones. 0 turns this off.
         </p>
+        <Check label="Auto nail spacing" checked={settings.autoSpacing} onChange={(autoSpacing) => set({ autoSpacing })} />
+        <p className="text-[11px] text-neutral-500">
+          Where the string can&apos;t reach the shading (tight curves, narrow bands), nails along nearby lines are moved closer together and
+          the pattern is worked out again. Spacing above is then the widest it goes.
+        </p>
       </Section>
 
       {hasArt && (
@@ -544,6 +572,13 @@ function NailsPanel() {
           <div className="grid grid-cols-2 gap-1">
             <Btn variant={pickMode === "regions" ? "primary" : "default"} onClick={() => toggleMode("regions")}>
               {pickMode === "regions" ? "Done" : "Pick regions"}
+            </Btn>
+            <Btn
+              variant={pickMode === "shade" ? "primary" : "default"}
+              title="Click regions to give them their own shading"
+              onClick={() => toggleMode("shade")}
+            >
+              {pickMode === "shade" ? "Done" : "Shade regions"}
             </Btn>
             <Btn
               variant={pickMode === "widths" ? "primary" : "default"}
@@ -568,6 +603,16 @@ function NailsPanel() {
               {pickMode === "nails" ? "Done" : "Remove nails"}
             </Btn>
           </div>
+          {pickMode === "shade" && (
+            <div className="space-y-1 rounded border border-amber-500/40 bg-amber-500/5 p-2">
+              <Field label="Shading to give">
+                <NumberInput value={paintShade} min={0.25} max={20} step={0.5} digits={2} onCommit={(v) => setState({ paintShade: v })} />
+              </Field>
+              <p className="text-[11px] text-neutral-400">
+                Click a region to give it this shading (the pattern&apos;s is {settings.shading}); click it again to go back.
+              </p>
+            </div>
+          )}
           {pickMode === "widths" && (
             <div className="space-y-1 rounded border border-amber-500/40 bg-amber-500/5 p-2">
               <Field label={`Width to give (${u}) · 0 = thin line`}>
@@ -592,6 +637,14 @@ function NailsPanel() {
                 {regionCount.removed} line{regionCount.removed === 1 ? "" : "s"} removed (dashed red)
               </span>
               <Btn onClick={restoreLines}>Restore</Btn>
+            </div>
+          )}
+          {regionCount.shaded > 0 && (
+            <div className="flex items-center justify-between text-xs text-neutral-400">
+              <span>
+                {regionCount.shaded} region{regionCount.shaded === 1 ? "" : "s"} with their own shading
+              </span>
+              <Btn onClick={restoreShades}>Restore</Btn>
             </div>
           )}
           {regionCount.painted > 0 && (
@@ -633,10 +686,12 @@ function NailsPanel() {
           </Field>
         </Row>
         <Check label="Outline (nail to neighbouring nail)" checked={settings.outline} onChange={(outline) => set({ outline })} />
-        <Check label="Edge pass (every nail to the one two along)" checked={settings.edgePass} onChange={(edgePass) => set({ edgePass })} />
+        <Check label="Allow more than one string per shape" checked={settings.restarts} onChange={(restarts) => set({ restarts })} />
         <p className="text-[11px] text-neutral-500">
-          Shading sets how much string goes into each shape for its area, so big and small shapes come out equally dark. The outline and
-          edge pass go around each shape first to crisp up its edge and fill curves and corners; they count towards the shading.
+          Shading is how dark every part of a shape should be; the string is spread to reach it evenly. Layers and regions can have their
+          own (Layers list, Shade regions). The outline goes around each shape first for a crisp edge and counts towards the shading. Each
+          shape is one continuous string, crossing the shape to reach light spots; allowing more than one ties off and starts again there
+          instead.
         </p>
         <Btn variant="primary" className="w-full" onClick={calculate} disabled={busy || !hasArt}>
           {busy ? "Calculating…" : pattern ? "Recalculate pattern" : "Calculate pattern"}
@@ -650,6 +705,12 @@ function NailsPanel() {
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
             <dt className="text-neutral-500">Shapes</dt>
             <dd className="text-right font-mono">{stats.shapes}</dd>
+            {stats.strings > stats.shapes && (
+              <>
+                <dt className="text-neutral-500">Strings</dt>
+                <dd className="text-right font-mono">{stats.strings}</dd>
+              </>
+            )}
             <dt className="text-neutral-500">Nails</dt>
             <dd className="text-right font-mono">{stats.nails}</dd>
             <dt className="text-neutral-500">String lines</dt>
@@ -673,8 +734,8 @@ function NailsPanel() {
           {!!pattern.issues?.light?.length && (
             <IssueNote
               tone="yellow"
-              text={`${pattern.issues.light.length} shape${pattern.issues.light.length === 1 ? " is" : "s are"} lighter than the rest.`}
-              hint="Outlined in yellow. They ran out of different nail-to-nail lines; raise Min nails per shape, use closer spacing, or enlarge the artwork."
+              text={`${pattern.issues.light.length} area${pattern.issues.light.length === 1 ? " is" : "s are"} lighter than the shading asked for.`}
+              hint="Outlined in yellow: the string couldn't reach the shading there with the nails available. Turn on Auto nail spacing, use closer spacing, or lower the shading there."
               spots={pattern.issues.light.map((rings) => boundsOf(rings.flat()))}
               spacing={settings.spacing}
             />
@@ -809,6 +870,25 @@ function ExportPanel() {
             <LengthInput value={print.overlap} units={units} min={0} onCommit={(overlap) => setPrint({ overlap })} />
           </Field>
         </Row>
+        <Row>
+          <Field label={`Cover bar measured (${u})`}>
+            <LengthInput
+              value={null}
+              placeholder={units === "in" ? "6" : "150"}
+              units={units}
+              min={0}
+              onCommit={(measured) => measured > 0 && setPrint({ scale: (print.scale * measured) / coverBar(units) })}
+            />
+          </Field>
+          <Field label="Printer scale (%)">
+            <NumberInput value={print.scale * 100} min={80} max={120} step={0.01} digits={2} onCommit={(v) => setPrint({ scale: v / 100 })} />
+          </Field>
+        </Row>
+        <p className="text-[11px] text-neutral-500">
+          If the {units === "in" ? "6 in" : "150 mm"} bar on the cover doesn&apos;t print exactly (borderless printing usually enlarges a little),
+          enter what it measures. Pages are then drawn to make up for it. Measure a print made at the printer scale shown; 100 = no
+          correction.
+        </p>
         <div className="grid grid-cols-2 gap-1.5">
           <Check label="Artwork outline" checked={print.outline} onChange={(outline) => setPrint({ outline })} />
           <Check label="Ref. shapes" checked={print.refs} onChange={(refs) => setPrint({ refs })} />
